@@ -90,7 +90,7 @@ impl DenseScanState {
 
         // Calculate number of aligned positions
         let num_positions = (data.len() - size) / alignment + 1;
-        let num_bytes = (num_positions + 7) / 8;
+        let num_bytes = num_positions.div_ceil(8);
 
         // All positions are valid initially
         let mut valid_bits = vec![0xFFu8; num_bytes];
@@ -124,12 +124,11 @@ impl DenseScanState {
     pub fn invalidate(&mut self, position: usize) {
         let byte_idx = position / 8;
         let bit_idx = position % 8;
-        if byte_idx < self.valid_bits.len() {
-            if self.valid_bits[byte_idx] & (1 << bit_idx) != 0 {
+        if byte_idx < self.valid_bits.len()
+            && self.valid_bits[byte_idx] & (1 << bit_idx) != 0 {
                 self.valid_bits[byte_idx] &= !(1 << bit_idx);
                 self.match_count = self.match_count.saturating_sub(1);
             }
-        }
     }
 
     /// Get the address for a position
@@ -203,11 +202,10 @@ impl DenseScanState {
         let mut results = Vec::with_capacity(self.match_count);
 
         for pos in 0..num_positions {
-            if self.is_valid(pos) {
-                if let Some(value) = self.value_at(pos) {
+            if self.is_valid(pos)
+                && let Some(value) = self.value_at(pos) {
                     results.push((self.address_at(pos), value));
                 }
-            }
         }
 
         results
@@ -270,11 +268,10 @@ impl ScanEngine {
                         let addr = Address(base.0 + offset as u64);
                         let slice = &data[offset..offset + size];
 
-                        if let Some(value) = decode_at(slice, &params.value_type) {
-                            if matches_comparison(&value, &params.comparison) {
+                        if let Some(value) = decode_at(slice, &params.value_type)
+                            && matches_comparison(&value, &params.comparison) {
                                 return Some((addr, value));
                             }
-                        }
                         None
                     })
                     .collect();

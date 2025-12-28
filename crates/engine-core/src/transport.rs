@@ -39,34 +39,24 @@ pub enum TransportError {
     Other(String),
 }
 
-/// In-memory transport using std channels
-pub struct InMemoryTransport {
-    command_tx: Sender<CommandEnvelope>,
-    command_rx: Receiver<CommandEnvelope>,
-    event_tx: Sender<EventEnvelope>,
-    event_rx: Receiver<EventEnvelope>,
-}
+/// Create a new in-memory transport pair using std channels.
+///
+/// Returns (ui_side, engine_side) handles for bidirectional communication.
+pub fn create_in_memory_transport() -> (UiTransport, EngineTransport) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (evt_tx, evt_rx) = mpsc::channel();
 
-impl InMemoryTransport {
-    /// Create a new in-memory transport pair
-    ///
-    /// Returns (ui_side, engine_side) handles
-    pub fn new() -> (UiTransport, EngineTransport) {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (evt_tx, evt_rx) = mpsc::channel();
+    let ui = UiTransport {
+        command_tx: cmd_tx,
+        event_rx: evt_rx,
+    };
 
-        let ui = UiTransport {
-            command_tx: cmd_tx,
-            event_rx: evt_rx,
-        };
+    let engine = EngineTransport {
+        command_rx: cmd_rx,
+        event_tx: evt_tx,
+    };
 
-        let engine = EngineTransport {
-            command_rx: cmd_rx,
-            event_tx: evt_tx,
-        };
-
-        (ui, engine)
-    }
+    (ui, engine)
 }
 
 /// UI-side transport handle
@@ -136,7 +126,7 @@ mod tests {
 
     #[test]
     fn roundtrip_command_event() {
-        let (ui, engine) = InMemoryTransport::new();
+        let (ui, engine) = create_in_memory_transport();
 
         // UI sends command
         let cmd = CommandEnvelope::new(EngineCommand::ListProcesses);

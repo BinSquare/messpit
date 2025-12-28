@@ -128,11 +128,10 @@ impl WatchManager {
                     for (id, address, value_type) in &watch_info {
                         let size = value_type.size().unwrap_or(256);
                         let mut buffer = vec![0u8; size];
-                        if process.read_memory(*address, &mut buffer).is_ok() {
-                            if let Some(value) = decode_at(&buffer, value_type) {
+                        if process.read_memory(*address, &mut buffer).is_ok()
+                            && let Some(value) = decode_at(&buffer, value_type) {
                                 updates.push((*id, value));
                             }
-                        }
                     }
 
                     // Process freezes
@@ -165,11 +164,10 @@ impl WatchManager {
 
                     // Handle freeze failures
                     for id in to_disable {
-                        if let Some(freeze) = sess.freezes.get_mut(&id) {
-                            if freeze.record_failure() {
+                        if let Some(freeze) = sess.freezes.get_mut(&id)
+                            && freeze.record_failure() {
                                 tracing::warn!(entry_id = ?id, "Freeze auto-disabled after too many failures");
                             }
-                        }
                     }
                 }
             }

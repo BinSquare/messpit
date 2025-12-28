@@ -38,6 +38,15 @@ pub enum PlatformError {
     #[error("Operation not supported on this platform: {0}")]
     UnsupportedOperation(String),
 
+    #[error("I/O error: {0}")]
+    IOError(String),
+
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
+
+    #[error("Unsupported architecture: {0}")]
+    UnsupportedArchitecture(String),
+
     #[error("System error: {0}")]
     SystemError(String),
 

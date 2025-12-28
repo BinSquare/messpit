@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use messpit_protocol::{Address, Architecture, EntryId, Value, ValueType};
+use messpit_protocol::{Architecture, Value, ValueType};
 
 /// Project file schema version
 pub const PROJECT_VERSION: u32 = 1;
