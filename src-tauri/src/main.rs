@@ -88,9 +88,6 @@ impl<T> MutexExt<T> for Mutex<T> {
 
 /// Helper trait for handling RwLock errors gracefully
 trait RwLockExt<T> {
-    /// Read lock, recovering from poison errors
-    fn read_or_recover(&self) -> RwLockReadGuard<'_, T>;
-
     /// Write lock, recovering from poison errors
     fn write_or_recover(&self) -> RwLockWriteGuard<'_, T>;
 
@@ -102,13 +99,6 @@ trait RwLockExt<T> {
 }
 
 impl<T> RwLockExt<T> for RwLock<T> {
-    fn read_or_recover(&self) -> RwLockReadGuard<'_, T> {
-        self.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("Recovered from poisoned RwLock (read)");
-            poisoned.into_inner()
-        })
-    }
-
     fn write_or_recover(&self) -> RwLockWriteGuard<'_, T> {
         self.write().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovered from poisoned RwLock (write)");
@@ -126,7 +116,7 @@ impl<T> RwLockExt<T> for RwLock<T> {
 }
 
 use messpit_engine::session::{FreezeEntry, WatchEntry};
-use messpit_engine::{decode_at, encode_value, new_shared_session, Pattern, PatternScanner, Project, ProjectSignature, ProjectWatchEntry, ScanEngine, SharedSession};
+use messpit_engine::{decode_at, encode_value, new_shared_session, AuditLog, Pattern, PatternScanner, Project, ProjectSignature, ProjectWatchEntry, ScanEngine, SharedSession};
 use messpit_platform::{attach, list_processes, PlatformError, ProcessHandle};
 use messpit_protocol::{Address, Architecture, EntryId, Pid, Refinement, RunId, ScanComparison, ScanParams, Value, ValueType};
 use messpit_script_host::{CancellationToken, HostRequest, HostResponse, ScriptConfig, ScriptHost, TYPESCRIPT_DEFINITIONS};
@@ -165,6 +155,10 @@ struct AppState {
     running_scripts: Mutex<HashMap<String, CancellationToken>>,
     /// Script output buffer (run_id -> output lines)
     script_output: Mutex<HashMap<String, Vec<String>>>,
+    /// Tracks if project has unsaved changes
+    has_unsaved_changes: std::sync::atomic::AtomicBool,
+    /// Audit log for tracking operations
+    audit_log: Mutex<AuditLog>,
 }
 
 struct AttachedProcess {
@@ -299,6 +293,9 @@ fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, 
 
     let mut guard = state.attached.lock_checked()?;
     *guard = Some(attached);
+    drop(guard);
+
+    record_audit(&state, "attach", Some(pid.0), None, Some(&format!("process: {}", result.name)));
 
     Ok(result)
 }
@@ -307,13 +304,20 @@ fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, 
 #[tauri::command]
 fn detach_process(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.attached.lock_checked()?;
+    let pid = guard.as_ref().map(|a| a.pid.0);
+    let name = guard.as_ref().map(|a| a.name.clone());
     if let Some(mut attached) = guard.take() {
         let _ = attached.handle.detach();
     }
+    drop(guard);
 
     // Clear scan results to free memory
     state.last_scan_results.lock_or_recover().clear();
     *state.last_scan_type.lock_or_recover() = None;
+
+    if let Some(pid) = pid {
+        record_audit(&state, "detach", Some(pid), None, name.as_deref());
+    }
 
     Ok(())
 }
@@ -520,6 +524,7 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
     }
 
     let entry_id = EntryId::new();
+    let label = request.label.clone();
     let entry = WatchEntry {
         id: entry_id,
         address,
@@ -529,6 +534,9 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
     };
 
     session.add_watch(entry);
+    drop(session);
+    mark_project_changed(&state);
+    record_audit(&state, "add_watch", None, Some(address), Some(&format!("label: {}", label)));
 
     Ok(entry_id.0.to_string())
 }
@@ -538,7 +546,11 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
 fn remove_watch(entry_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let id = EntryId(entry_id.parse().map_err(|_| "Invalid entry ID")?);
     let mut session = state.session.write_checked()?;
+    let address = session.watches.get(&id).map(|w| w.address);
     session.remove_watch(&id);
+    drop(session);
+    mark_project_changed(&state);
+    record_audit(&state, "remove_watch", None, address, Some(&entry_id));
     Ok(())
 }
 
@@ -581,15 +593,17 @@ fn toggle_freeze(request: FreezeRequest, state: State<'_, AppState>) -> Result<b
     let id = EntryId(request.entry_id.parse().map_err(|_| "Invalid entry ID")?);
     let mut session = state.session.write_checked()?;
 
-    if session.freezes.contains_key(&id) {
+    let (result, address) = if session.freezes.contains_key(&id) {
+        let addr = session.freezes.get(&id).map(|f| f.address);
         session.remove_freeze(&id);
-        Ok(false)
+        (false, addr)
     } else {
         // Get watch entry to create freeze
         let watch = session.watches.get(&id)
             .ok_or("Watch entry not found")?;
 
         let value = parse_value(&request.value, &watch.value_type)?;
+        let addr = watch.address;
         let freeze = FreezeEntry::new(
             id,
             watch.address,
@@ -598,8 +612,19 @@ fn toggle_freeze(request: FreezeRequest, state: State<'_, AppState>) -> Result<b
             10, // 10ms interval
         );
         session.set_freeze(id, freeze);
-        Ok(true)
-    }
+        (true, Some(addr))
+    };
+
+    drop(session);
+    mark_project_changed(&state);
+    record_audit(
+        &state,
+        if result { "freeze_enabled" } else { "freeze_disabled" },
+        None,
+        address,
+        Some(&format!("value: {}", request.value)),
+    );
+    Ok(result)
 }
 
 /// Write a value directly to memory
@@ -619,9 +644,19 @@ fn write_value(request: WriteValueRequest, state: State<'_, AppState>) -> Result
     let value_type = parse_value_type(&request.value_type)?;
     let value = parse_value(&request.value, &value_type)?;
     let bytes = encode_value(&value);
+    let pid = attached.pid.0;
 
     attached.handle.write_memory(address, &bytes)
         .map_err(|e| e.to_string())?;
+
+    drop(guard);
+    record_audit(
+        &state,
+        "write_value",
+        Some(pid),
+        Some(address),
+        Some(&format!("type: {}, value: {}", request.value_type, request.value)),
+    );
 
     Ok(())
 }
@@ -643,11 +678,10 @@ fn read_value(request: ReadValueRequest, state: State<'_, AppState>) -> Result<O
     let size = value_type.size().unwrap_or(8);
 
     let mut buf = vec![0u8; size];
-    if attached.handle.read_memory(address, &mut buf).is_ok() {
-        if let Some(value) = decode_at(&buf, &value_type) {
+    if attached.handle.read_memory(address, &mut buf).is_ok()
+        && let Some(value) = decode_at(&buf, &value_type) {
             return Ok(Some(format_val(&value)));
         }
-    }
 
     Ok(None)
 }
@@ -780,8 +814,58 @@ fn get_project_info(state: State<'_, AppState>) -> ProjectInfo {
         name: project.name.clone(),
         path: path.clone(),
         watch_count: project.watch_entries.len(),
-        has_unsaved_changes: false, // TODO: track changes
+        has_unsaved_changes: state.has_unsaved_changes.load(std::sync::atomic::Ordering::SeqCst),
     }
+}
+
+/// Mark the project as having unsaved changes
+fn mark_project_changed(state: &AppState) {
+    state.has_unsaved_changes.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Mark the project as saved (no unsaved changes)
+fn mark_project_saved(state: &AppState) {
+    state.has_unsaved_changes.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Record an audit log entry
+fn record_audit(state: &AppState, operation: &str, pid: Option<u32>, address: Option<Address>, details: Option<&str>) {
+    if let Ok(mut log) = state.audit_log.lock() {
+        log.record(operation, pid, address, details);
+    }
+}
+
+/// Audit log entry for frontend
+#[derive(Serialize)]
+struct AuditEntryInfo {
+    timestamp: String,
+    operation: String,
+    pid: Option<u32>,
+    address: Option<String>,
+    details: Option<String>,
+}
+
+/// Get all audit log entries
+#[tauri::command]
+fn get_audit_log(state: State<'_, AppState>) -> Vec<AuditEntryInfo> {
+    let log = state.audit_log.lock_or_recover();
+    log.entries()
+        .iter()
+        .map(|e| AuditEntryInfo {
+            timestamp: e.timestamp.clone(),
+            operation: e.operation.clone(),
+            pid: e.target_pid,
+            address: e.address.map(|a| format!("0x{:X}", a.0)),
+            details: e.details.clone(),
+        })
+        .collect()
+}
+
+/// Clear the audit log
+#[tauri::command]
+fn clear_audit_log(state: State<'_, AppState>) {
+    let mut log = state.audit_log.lock_or_recover();
+    log.clear();
 }
 
 /// Create a new project
@@ -848,6 +932,13 @@ fn save_project(file_path: String, state: State<'_, AppState>) -> Result<(), Str
     project.save(&file_path).map_err(|e| e.to_string())?;
     *saved_path = Some(file_path);
 
+    // Release locks before marking saved
+    drop(project);
+    drop(saved_path);
+    drop(session);
+    drop(attached);
+
+    mark_project_saved(&state);
     Ok(())
 }
 
@@ -877,8 +968,8 @@ fn load_project(file_path: String, state: State<'_, AppState>) -> Result<Project
         session.add_watch(watch);
 
         // Restore freeze if applicable
-        if entry.frozen {
-            if let Some(ref freeze_val) = entry.freeze_value {
+        if entry.frozen
+            && let Some(ref freeze_val) = entry.freeze_value {
                 let freeze = FreezeEntry::new(
                     EntryId(id),
                     Address(entry.address),
@@ -888,20 +979,27 @@ fn load_project(file_path: String, state: State<'_, AppState>) -> Result<Project
                 );
                 session.set_freeze(EntryId(id), freeze);
             }
-        }
     }
 
-    let info = ProjectInfo {
-        name: loaded.name.clone(),
-        path: Some(file_path.clone()),
-        watch_count: loaded.watch_entries.len(),
-        has_unsaved_changes: false,
-    };
+    let watch_count = loaded.watch_entries.len();
+    let name = loaded.name.clone();
 
     *project = loaded;
-    *saved_path = Some(file_path);
+    *saved_path = Some(file_path.clone());
 
-    Ok(info)
+    // Release locks before marking saved
+    drop(project);
+    drop(saved_path);
+    drop(session);
+
+    mark_project_saved(&state);
+
+    Ok(ProjectInfo {
+        name,
+        path: Some(file_path),
+        watch_count,
+        has_unsaved_changes: false,
+    })
 }
 
 /// Export project as JSON (for sharing)
@@ -1278,6 +1376,111 @@ fn get_script_api_types() -> String {
 }
 
 // ============================================================================
+// Script Management Commands
+// ============================================================================
+
+/// Script info for frontend
+#[derive(Serialize, Clone)]
+struct ScriptInfo {
+    id: String,
+    name: String,
+    source: String,
+    enabled: bool,
+}
+
+/// Save a script to the project
+#[tauri::command]
+fn save_script(id: String, name: String, source: String, state: State<'_, AppState>) -> Result<(), String> {
+    // Validate input lengths
+    if name.len() > MAX_LABEL_LENGTH {
+        return Err(format!("Script name too long (max {} characters)", MAX_LABEL_LENGTH));
+    }
+    if source.len() > 100_000 {
+        return Err("Script source too long (max 100KB)".to_string());
+    }
+
+    let mut project = state.project.lock_checked()?;
+
+    let script = messpit_engine::ProjectScript {
+        id,
+        name,
+        source,
+        enabled: false,
+    };
+
+    project.add_script(script);
+
+    drop(project);
+    mark_project_changed(&state);
+
+    Ok(())
+}
+
+/// Delete a script from the project
+#[tauri::command]
+fn delete_script(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut project = state.project.lock_checked()?;
+
+    let before_len = project.scripts.len();
+    project.scripts.retain(|s| s.id != id);
+
+    if project.scripts.len() == before_len {
+        return Err("Script not found".to_string());
+    }
+
+    drop(project);
+    mark_project_changed(&state);
+
+    Ok(())
+}
+
+/// Get all scripts from the project
+#[tauri::command]
+fn get_scripts(state: State<'_, AppState>) -> Result<Vec<ScriptInfo>, String> {
+    let project = state.project.lock_checked()?;
+
+    let scripts = project.scripts.iter().map(|s| ScriptInfo {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        source: s.source.clone(),
+        enabled: s.enabled,
+    }).collect();
+
+    Ok(scripts)
+}
+
+/// Get a single script by ID
+#[tauri::command]
+fn get_script(id: String, state: State<'_, AppState>) -> Result<ScriptInfo, String> {
+    let project = state.project.lock_checked()?;
+
+    project.scripts.iter()
+        .find(|s| s.id == id)
+        .map(|s| ScriptInfo {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            source: s.source.clone(),
+            enabled: s.enabled,
+        })
+        .ok_or_else(|| "Script not found".to_string())
+}
+
+/// Update script enabled state
+#[tauri::command]
+fn set_script_enabled(id: String, enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut project = state.project.lock_checked()?;
+
+    if let Some(script) = project.scripts.iter_mut().find(|s| s.id == id) {
+        script.enabled = enabled;
+        drop(project);
+        mark_project_changed(&state);
+        Ok(())
+    } else {
+        Err("Script not found".to_string())
+    }
+}
+
+// ============================================================================
 // Pattern Scanning Commands
 // ============================================================================
 
@@ -1321,11 +1524,10 @@ fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Resu
     }
 
     // Validate module name if provided
-    if let Some(ref module) = request.module {
-        if module.len() > MAX_LABEL_LENGTH {
+    if let Some(ref module) = request.module
+        && module.len() > MAX_LABEL_LENGTH {
             return Err(format!("Module name too long (max {} characters)", MAX_LABEL_LENGTH));
         }
-    }
 
     let guard = state.attached.lock_checked()?;
     let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
@@ -1603,9 +1805,26 @@ fn main() {
 
     let session = new_shared_session();
 
+    // Set up audit log with file persistence
+    let audit_log = {
+        // Use system log directory or fall back to current directory
+        let log_path = dirs::data_local_dir()
+            .map(|p| p.join("messpit").join("audit.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("messpit_audit.log"));
+
+        // Ensure parent directory exists
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        tracing::info!("Audit log file: {}", log_path.display());
+        AuditLog::with_file(1000, log_path)
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             session,
             attached: Mutex::new(None),
@@ -1615,13 +1834,14 @@ fn main() {
             project_path: Mutex::new(None),
             running_scripts: Mutex::new(HashMap::new()),
             script_output: Mutex::new(HashMap::new()),
+            has_unsaved_changes: std::sync::atomic::AtomicBool::new(false),
+            audit_log: Mutex::new(audit_log),
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = window.try_state::<AppState>() {
+            if let tauri::WindowEvent::Destroyed = event
+                && let Some(state) = window.try_state::<AppState>() {
                     cleanup_on_exit(&state);
                 }
-            }
         })
         .invoke_handler(tauri::generate_handler![
             list_processes_cmd,
@@ -1655,6 +1875,12 @@ fn main() {
             get_script_output,
             clear_script_output,
             get_script_api_types,
+            // Script management commands
+            save_script,
+            delete_script,
+            get_scripts,
+            get_script,
+            set_script_enabled,
             // Pattern scanning commands
             pattern_scan,
             add_signature,
@@ -1662,6 +1888,9 @@ fn main() {
             get_signatures,
             resolve_signature,
             watch_from_signature,
+            // Audit log commands
+            get_audit_log,
+            clear_audit_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

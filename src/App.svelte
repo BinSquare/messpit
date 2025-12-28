@@ -80,7 +80,18 @@
   let selectedPid: number | null = $state(null);
 
   // Tabs
-  let activeTab = $state<"scan" | "watch" | "regions" | "patterns">("scan");
+  let activeTab = $state<"scan" | "watch" | "regions" | "patterns" | "audit">("scan");
+
+  // Audit log
+  interface AuditEntry {
+    timestamp: string;
+    operation: string;
+    pid: number | null;
+    address: string | null;
+    details: string | null;
+  }
+  let auditLogs: AuditEntry[] = $state([]);
+  let loadingAudit = $state(false);
 
   // Console panel
   let consoleOpen = $state(false);
@@ -128,20 +139,64 @@
   let wizardValueName = $state(""); // e.g., "Health", "Ammo", "Money"
   let wizardHistory: string[] = $state([]); // Track what user did
 
-  // Script
-  let scriptSource = $state(`// Messpit Script
+  // Script tabs
+  interface ScriptTab {
+    id: string;
+    name: string;
+    source: string;
+    output: string[];
+    runId: string | null;
+    running: boolean;
+    dirty: boolean; // Has unsaved changes
+    savedId: string | null; // ID in project, null if never saved
+  }
+
+  interface SavedScript {
+    id: string;
+    name: string;
+    source: string;
+    enabled: boolean;
+  }
+
+  const DEFAULT_SCRIPT = `// Messpit Script
 // Available API: mem.read, mem.write, watch.add, freeze.set, ui.notify, time.sleep
 
 // Example: Read and print a value
 // const value = mem.read(0x12345678, "i32");
 // ui.print("Value: " + value);
+`;
 
-1 + 2 + 3
-`);
-  let scriptRunning = $state(false);
-  let scriptRunId: string | null = $state(null);
-  let scriptOutput: string[] = $state([]);
+  function createNewTab(name: string = "Untitled", source: string = DEFAULT_SCRIPT): ScriptTab {
+    return {
+      id: crypto.randomUUID(),
+      name,
+      source,
+      output: [],
+      runId: null,
+      running: false,
+      dirty: false,
+      savedId: null,
+    };
+  }
+
+  let scriptTabs: ScriptTab[] = $state([createNewTab()]);
+  let activeTabId: string = $state(scriptTabs[0].id);
+  let savedScripts: SavedScript[] = $state([]);
+  let showScriptMenu = $state(false);
+  let editingTabName: string | null = $state(null);
+  let editingTabNameValue = $state("");
   let scriptApiTypes = $state("");
+
+  // Derived: get active tab
+  function getActiveTab(): ScriptTab | undefined {
+    return scriptTabs.find(t => t.id === activeTabId);
+  }
+
+  // Legacy compatibility - will be refactored
+  let scriptRunning = $derived(getActiveTab()?.running ?? false);
+  let scriptRunId = $derived(getActiveTab()?.runId ?? null);
+  let scriptOutput = $derived(getActiveTab()?.output ?? []);
+  let scriptSource = $derived(getActiveTab()?.source ?? "");
 
   // Pattern scanning
   let patternInput = $state("");
@@ -221,8 +276,10 @@
       selectedPid = pid;
       loadRegions();
       startWatchPolling();
+      showToast(`Attached to ${attachedProcess.name}`, "success");
     } catch (e) {
       error = String(e);
+      showToast("Failed to attach to process", "error");
     }
   }
 
@@ -318,21 +375,85 @@
         }
       });
       await loadWatches();
+      showToast("Added to watch list", "success");
       activeTab = "watch";
     } catch (e) {
       error = String(e);
+      showToast("Failed to add to watch", "error");
     }
   }
 
   async function loadWatches() {
     loadingWatches = true;
     try {
-      watches = await invoke<WatchInfo[]>("get_watches");
+      const newWatches = await invoke<WatchInfo[]>("get_watches");
+
+      // Track value changes
+      for (const watch of newWatches) {
+        const prevValue = previousWatchValues.get(watch.id);
+        if (prevValue !== undefined && prevValue !== watch.value) {
+          // Value changed - add to changed set
+          changedWatchIds = new Set([...changedWatchIds, watch.id]);
+          // Remove from changed set after animation
+          setTimeout(() => {
+            changedWatchIds = new Set([...changedWatchIds].filter(id => id !== watch.id));
+          }, 1500);
+        }
+        previousWatchValues.set(watch.id, watch.value);
+      }
+
+      watches = newWatches;
     } catch (e) {
       // Silently handle watch load errors during polling
     } finally {
       loadingWatches = false;
     }
+  }
+
+  // Audit log functions
+  async function loadAuditLog() {
+    loadingAudit = true;
+    try {
+      auditLogs = await invoke<AuditEntry[]>("get_audit_log");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      loadingAudit = false;
+    }
+  }
+
+  async function clearAuditLog() {
+    try {
+      await invoke("clear_audit_log");
+      auditLogs = [];
+      showToast("Audit log cleared", "info");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function formatAuditTimestamp(timestamp: string): string {
+    try {
+      const date = new Date(timestamp);
+      return date.toLocaleString();
+    } catch {
+      return timestamp;
+    }
+  }
+
+  function formatProcessPath(path: string | null): string {
+    if (!path) return "";
+    // Get the parent directory for context
+    const parts = path.split("/");
+    if (parts.length <= 2) return path;
+    // Show last 2-3 path components
+    const name = parts.pop() || "";
+    const parent = parts.pop() || "";
+    const grandparent = parts.pop() || "";
+    if (grandparent) {
+      return `${grandparent}/${parent}`;
+    }
+    return parent;
   }
 
   async function removeWatch(id: string) {
@@ -353,8 +474,10 @@
         }
       });
       await loadWatches();
+      showToast(watch.frozen ? "Value unfrozen" : "Value frozen", "info");
     } catch (e) {
       error = String(e);
+      showToast("Failed to toggle freeze", "error");
     }
   }
 
@@ -430,8 +553,10 @@
       });
       await loadWatches();
       cancelEditingWatch();
+      showToast("Value written to memory", "success");
     } catch (e) {
       error = String(e);
+      showToast("Failed to write value", "error");
     }
   }
 
@@ -565,39 +690,90 @@
     editingProjectName = false;
   }
 
-  // Script functions
-  async function runScript() {
-    if (scriptRunning) return;
+  // Script tab functions
+  function updateActiveTab(updates: Partial<ScriptTab>) {
+    scriptTabs = scriptTabs.map(t =>
+      t.id === activeTabId ? { ...t, ...updates } : t
+    );
+  }
 
-    scriptRunning = true;
-    scriptOutput = [];
+  function addNewTab() {
+    const newTab = createNewTab();
+    scriptTabs = [...scriptTabs, newTab];
+    activeTabId = newTab.id;
+  }
+
+  function closeTab(tabId: string) {
+    if (scriptTabs.length <= 1) return; // Keep at least one tab
+
+    const idx = scriptTabs.findIndex(t => t.id === tabId);
+    scriptTabs = scriptTabs.filter(t => t.id !== tabId);
+
+    // If closing active tab, switch to adjacent
+    if (activeTabId === tabId) {
+      activeTabId = scriptTabs[Math.max(0, idx - 1)].id;
+    }
+  }
+
+  function switchTab(tabId: string) {
+    activeTabId = tabId;
+  }
+
+  function updateTabSource(source: string) {
+    updateActiveTab({ source, dirty: true });
+  }
+
+  function startRenameTab(tabId: string) {
+    const tab = scriptTabs.find(t => t.id === tabId);
+    if (tab) {
+      editingTabName = tabId;
+      editingTabNameValue = tab.name;
+    }
+  }
+
+  function finishRenameTab() {
+    if (editingTabName && editingTabNameValue.trim()) {
+      scriptTabs = scriptTabs.map(t =>
+        t.id === editingTabName ? { ...t, name: editingTabNameValue.trim(), dirty: true } : t
+      );
+    }
+    editingTabName = null;
+    editingTabNameValue = "";
+  }
+
+  async function runScript() {
+    const tab = getActiveTab();
+    if (!tab || tab.running) return;
+
+    updateActiveTab({ running: true, output: [] });
     error = null;
 
     try {
-      const result = await invoke<ScriptRunResult>("run_script", { source: scriptSource });
-      scriptRunId = result.run_id;
+      const result = await invoke<ScriptRunResult>("run_script", { source: tab.source });
+      updateActiveTab({ runId: result.run_id });
 
       // Get the output
       const output = await invoke<ScriptOutputResult>("get_script_output", { runId: result.run_id });
-      scriptOutput = output.lines;
+      updateActiveTab({ output: output.lines });
     } catch (e) {
       error = String(e);
-      scriptOutput = [`Error: ${e}`];
+      updateActiveTab({ output: [`Error: ${e}`] });
     } finally {
-      scriptRunning = false;
+      updateActiveTab({ running: false });
     }
   }
 
   async function cancelScript() {
-    if (!scriptRunId) return;
+    const tab = getActiveTab();
+    if (!tab?.runId) return;
 
     try {
-      await invoke("cancel_script", { runId: scriptRunId });
-      scriptOutput = [...scriptOutput, "Script cancelled."];
+      await invoke("cancel_script", { runId: tab.runId });
+      updateActiveTab({ output: [...tab.output, "Script cancelled."] });
     } catch (e) {
       // Script may have already finished
     }
-    scriptRunning = false;
+    updateActiveTab({ running: false });
   }
 
   async function loadScriptApiTypes() {
@@ -606,6 +782,123 @@
     } catch (e) {
       // Ignore
     }
+  }
+
+  async function loadSavedScripts() {
+    try {
+      savedScripts = await invoke<SavedScript[]>("get_scripts");
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  async function saveCurrentScript() {
+    const tab = getActiveTab();
+    if (!tab) return;
+
+    try {
+      const id = tab.savedId || crypto.randomUUID();
+      await invoke("save_script", {
+        id,
+        name: tab.name,
+        source: tab.source,
+      });
+      updateActiveTab({ savedId: id, dirty: false });
+      await loadSavedScripts();
+      showToast("Script saved", "success");
+    } catch (e) {
+      showToast(`Failed to save: ${e}`, "error");
+    }
+  }
+
+  async function openSavedScript(script: SavedScript) {
+    // Check if already open
+    const existing = scriptTabs.find(t => t.savedId === script.id);
+    if (existing) {
+      activeTabId = existing.id;
+      showScriptMenu = false;
+      return;
+    }
+
+    // Open in new tab
+    const newTab: ScriptTab = {
+      id: crypto.randomUUID(),
+      name: script.name,
+      source: script.source,
+      output: [],
+      runId: null,
+      running: false,
+      dirty: false,
+      savedId: script.id,
+    };
+    scriptTabs = [...scriptTabs, newTab];
+    activeTabId = newTab.id;
+    showScriptMenu = false;
+  }
+
+  async function deleteSavedScript(scriptId: string) {
+    try {
+      await invoke("delete_script", { id: scriptId });
+      await loadSavedScripts();
+      showToast("Script deleted", "success");
+    } catch (e) {
+      showToast(`Failed to delete: ${e}`, "error");
+    }
+  }
+
+  async function importScriptFromFile() {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "JavaScript", extensions: ["js"] }],
+      });
+
+      if (selected) {
+        const { readTextFile } = await import("@tauri-apps/plugin-fs");
+        const content = await readTextFile(selected);
+        const fileName = selected.split("/").pop()?.replace(".js", "") || "Imported";
+
+        const newTab: ScriptTab = {
+          id: crypto.randomUUID(),
+          name: fileName,
+          source: content,
+          output: [],
+          runId: null,
+          running: false,
+          dirty: true,
+          savedId: null,
+        };
+        scriptTabs = [...scriptTabs, newTab];
+        activeTabId = newTab.id;
+        showToast("Script imported", "success");
+      }
+    } catch (e) {
+      showToast(`Failed to import: ${e}`, "error");
+    }
+    showScriptMenu = false;
+  }
+
+  async function exportCurrentScript() {
+    const tab = getActiveTab();
+    if (!tab) return;
+
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        defaultPath: `${tab.name}.js`,
+        filters: [{ name: "JavaScript", extensions: ["js"] }],
+      });
+
+      if (path) {
+        const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+        await writeTextFile(path, tab.source);
+        showToast("Script exported", "success");
+      }
+    } catch (e) {
+      showToast(`Failed to export: ${e}`, "error");
+    }
+    showScriptMenu = false;
   }
 
   // Pattern scanning functions
@@ -786,6 +1079,13 @@
       const matchesAttachable = !showOnlyAttachable || p.attachable === true;
 
       return matchesText && matchesAttachable;
+    }).sort((a, b) => {
+      // Sort pinned processes first
+      const aPinned = pinnedPids.includes(a.pid);
+      const bPinned = pinnedPids.includes(b.pid);
+      if (aPinned && !bPinned) return -1;
+      if (!aPinned && bPinned) return 1;
+      return 0;
     })
   );
 
@@ -822,7 +1122,12 @@
     if ((e.ctrlKey || e.metaKey) && e.key === '`') {
       e.preventDefault();
       consoleOpen = !consoleOpen;
-      if (consoleOpen) loadScriptApiTypes();
+      if (consoleOpen) { loadScriptApiTypes(); loadSavedScripts(); }
+    }
+    // Ctrl/Cmd+S to save current script when console is open
+    if ((e.ctrlKey || e.metaKey) && e.key === 's' && consoleOpen) {
+      e.preventDefault();
+      saveCurrentScript();
     }
     // Escape to close console when open
     if (e.key === 'Escape' && consoleOpen) {
@@ -830,28 +1135,71 @@
     }
   }
 
-  // Simple syntax highlighting for JavaScript
+  // Simple syntax highlighting for JavaScript using tokenization
   function highlightCode(code: string): string {
+    // Tokenize to avoid regex interference between different token types
+    const tokens: { type: string; value: string; start: number; end: number }[] = [];
+
+    // Find all comments first (highest priority)
+    const commentRegex = /(\/\/.*$|\/\*[\s\S]*?\*\/)/gm;
+    let match;
+    while ((match = commentRegex.exec(code)) !== null) {
+      tokens.push({ type: 'comment', value: match[0], start: match.index, end: match.index + match[0].length });
+    }
+
+    // Find all strings (but not if inside a comment)
+    const stringRegex = /(["'`])(?:(?!\1)[^\\]|\\.)*?\1/g;
+    while ((match = stringRegex.exec(code)) !== null) {
+      const inComment = tokens.some(t => t.type === 'comment' && match!.index >= t.start && match!.index < t.end);
+      if (!inComment) {
+        tokens.push({ type: 'string', value: match[0], start: match.index, end: match.index + match[0].length });
+      }
+    }
+
+    // Sort tokens by position
+    tokens.sort((a, b) => a.start - b.start);
+
+    // Build result by processing gaps between tokens
+    let result = '';
+    let pos = 0;
+
+    for (const token of tokens) {
+      // Process text before this token (apply keyword/number/function highlighting)
+      if (token.start > pos) {
+        result += highlightPlainCode(code.slice(pos, token.start));
+      }
+
+      // Add the token with its highlighting
+      const escaped = token.value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      result += `<span class="hl-${token.type}">${escaped}</span>`;
+      pos = token.end;
+    }
+
+    // Process remaining text after last token
+    if (pos < code.length) {
+      result += highlightPlainCode(code.slice(pos));
+    }
+
+    return result;
+  }
+
+  function highlightPlainCode(code: string): string {
     const keywords = /\b(const|let|var|function|return|if|else|for|while|async|await|try|catch|throw|new|class|extends|import|export|from|true|false|null|undefined)\b/g;
-    const strings = /(["'`])(?:(?!\1)[^\\]|\\.)*?\1/g;
-    const comments = /(\/\/.*$|\/\*[\s\S]*?\*\/)/gm;
     const numbers = /\b(\d+\.?\d*)\b/g;
     const functions = /\b([a-zA-Z_]\w*)\s*(?=\()/g;
 
-    let highlighted = code
+    let result = code
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
-    // Order matters - comments first, then strings, then others
-    highlighted = highlighted
-      .replace(comments, '<span class="hl-comment">$1</span>')
-      .replace(strings, '<span class="hl-string">$&</span>')
+    // Apply highlighting - order matters for overlapping matches
+    result = result
+      .replace(functions, '<span class="hl-function">$1</span>')
       .replace(keywords, '<span class="hl-keyword">$1</span>')
-      .replace(numbers, '<span class="hl-number">$1</span>')
-      .replace(functions, '<span class="hl-function">$1</span>');
+      .replace(numbers, '<span class="hl-number">$1</span>');
 
-    return highlighted;
+    return result;
   }
 
   // Auto-scroll output to bottom
@@ -862,6 +1210,7 @@
   });
 
   $effect(() => {
+    loadPinnedProcesses();
     loadProcesses();
     loadProjectInfo();
     return () => stopWatchPolling();
@@ -958,22 +1307,40 @@
 
     <div class="process-list">
       {#each filteredProcesses as proc (proc.pid)}
-        <button
-          class="process-item"
-          class:selected={selectedPid === proc.pid}
-          onclick={() => attachToProcess(proc.pid)}
-          type="button"
-        >
-          <div class="process-icon" class:attachable-icon={proc.attachable}>
+        <div class="process-item-wrapper" class:pinned={pinnedPids.includes(proc.pid)}>
+          <button
+            class="process-item"
+            class:selected={selectedPid === proc.pid}
+            onclick={() => attachToProcess(proc.pid)}
+            type="button"
+          >
+            <div class="process-icon" class:attachable-icon={proc.attachable}>
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+              </svg>
+            </div>
+            <div class="process-info">
+              <span class="process-name">{proc.name}</span>
+              <span class="process-details">
+                <span class="process-pid">PID {proc.pid}</span>
+                {#if proc.path}
+                  <span class="process-path" title={proc.path}>{formatProcessPath(proc.path)}</span>
+                {/if}
+              </span>
+            </div>
+          </button>
+          <button
+            class="pin-btn"
+            class:pinned={pinnedPids.includes(proc.pid)}
+            onclick={(e) => { e.stopPropagation(); togglePinProcess(proc.pid); }}
+            title={pinnedPids.includes(proc.pid) ? "Unpin process" : "Pin process"}
+            type="button"
+          >
             <svg viewBox="0 0 20 20" fill="currentColor">
-              <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+              <path d="M9.828 3.172a4 4 0 015.657 5.657L10 14.314l-5.485-5.485a4 4 0 115.657-5.657l.354.353.353-.353z" />
             </svg>
-          </div>
-          <div class="process-info">
-            <span class="process-name">{proc.name}</span>
-            <span class="process-pid">PID {proc.pid} | attachable={String(proc.attachable)} | type={typeof proc.attachable}</span>
-          </div>
-        </button>
+          </button>
+        </div>
       {:else}
         <div class="empty-state">
           {#if loading}
@@ -1090,12 +1457,27 @@
             <span class="badge">{signatures.length}</span>
           {/if}
         </button>
+        <button
+          class="tab-item"
+          class:active={activeTab === "audit"}
+          onclick={() => { activeTab = "audit"; loadAuditLog(); }}
+          type="button"
+          title="View audit log of all operations"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clip-rule="evenodd" />
+          </svg>
+          Audit
+          {#if auditLogs.length > 0}
+            <span class="badge">{auditLogs.length}</span>
+          {/if}
+        </button>
         <!-- Console toggle on the right side of tab bar -->
         <div class="tab-spacer"></div>
         <button
           class="tab-item console-toggle"
           class:active={consoleOpen}
-          onclick={() => { consoleOpen = !consoleOpen; if (consoleOpen) loadScriptApiTypes(); }}
+          onclick={() => { consoleOpen = !consoleOpen; if (consoleOpen) { loadScriptApiTypes(); loadSavedScripts(); } }}
           type="button"
           title="Toggle script console"
         >
@@ -1614,7 +1996,7 @@
                     </thead>
                     <tbody>
                       {#each watches as watch (watch.id)}
-                        <tr class:frozen={watch.frozen} class:editing={editingWatchId === watch.id}>
+                        <tr class:frozen={watch.frozen} class:editing={editingWatchId === watch.id} class:value-changed={changedWatchIds.has(watch.id)}>
                           <td class="label-cell">{watch.label}</td>
                           <td class="mono">{watch.address}</td>
                           <td class="type-cell">{watch.value_type}</td>
@@ -1639,7 +2021,7 @@
                                 </button>
                               </div>
                             {:else}
-                              <span class="value-display" class:no-value={!watch.value}>
+                              <span class="value-display" class:no-value={!watch.value} class:changed={changedWatchIds.has(watch.id)}>
                                 {watch.value ?? (attachedProcess ? "—" : "N/A")}
                               </span>
                             {/if}
@@ -1953,6 +2335,68 @@
               </div>
             </div>
           </div>
+        {:else if activeTab === "audit"}
+          <!-- Audit Log Tab -->
+          <div class="tab-content audit-tab">
+            <div class="section-header">
+              <h3>Audit Log</h3>
+              <div class="section-actions">
+                <button class="btn btn-secondary btn-sm" onclick={loadAuditLog} disabled={loadingAudit}>
+                  <svg viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+                  </svg>
+                  Refresh
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick={clearAuditLog} disabled={auditLogs.length === 0}>
+                  <svg viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                  </svg>
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            {#if loadingAudit}
+              <div class="loading-spinner">Loading audit log...</div>
+            {:else if auditLogs.length > 0}
+              <div class="audit-log-container">
+                <table class="data-table audit-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Operation</th>
+                      <th>PID</th>
+                      <th>Address</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each auditLogs.slice().reverse() as entry}
+                      <tr class="audit-entry audit-{entry.operation.split('_')[0]}">
+                        <td class="timestamp">{formatAuditTimestamp(entry.timestamp)}</td>
+                        <td class="operation">
+                          <span class="operation-badge {entry.operation.includes('write') || entry.operation.includes('freeze') ? 'write' : entry.operation.includes('attach') ? 'attach' : 'read'}">
+                            {entry.operation}
+                          </span>
+                        </td>
+                        <td class="pid">{entry.pid ?? '-'}</td>
+                        <td class="address mono">{entry.address ?? '-'}</td>
+                        <td class="details">{entry.details ?? '-'}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {:else}
+              <div class="empty-results">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z" />
+                </svg>
+                <p>No audit entries yet</p>
+                <span>Operations like attach, write, freeze, and watch changes will be logged here</span>
+              </div>
+            {/if}
+          </div>
         {/if}
       </div>
 
@@ -1961,20 +2405,97 @@
         <div class="console-panel" style="height: {consoleHeight}px" class:resizing={isResizingConsole}>
           <div class="console-resize-handle" onmousedown={startConsoleResize}></div>
           <div class="console-header">
-            <div class="console-title">
-              <svg viewBox="0 0 20 20" fill="currentColor">
-                <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414zM11 12a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" />
-              </svg>
-              <span>Console</span>
-              <span class="console-shortcut">⌘`</span>
-              {#if scriptRunning}
-                <span class="console-running-badge">
-                  <div class="btn-spinner-small"></div>
-                  Running
-                </span>
-              {/if}
+            <!-- Script Tabs -->
+            <div class="script-tabs">
+              {#each scriptTabs as tab (tab.id)}
+                <button
+                  class="script-tab"
+                  class:active={tab.id === activeTabId}
+                  onclick={() => switchTab(tab.id)}
+                  ondblclick={() => startRenameTab(tab.id)}
+                  title={tab.name}
+                >
+                  {#if editingTabName === tab.id}
+                    <input
+                      type="text"
+                      class="tab-name-input"
+                      bind:value={editingTabNameValue}
+                      onblur={finishRenameTab}
+                      onkeydown={(e) => e.key === 'Enter' && finishRenameTab()}
+                      autofocus
+                    />
+                  {:else}
+                    <span class="tab-name">{tab.name}</span>
+                    {#if tab.dirty}
+                      <span class="tab-dirty">●</span>
+                    {/if}
+                    {#if tab.running}
+                      <div class="btn-spinner-small"></div>
+                    {/if}
+                  {/if}
+                  {#if scriptTabs.length > 1}
+                    <button
+                      class="tab-close"
+                      onclick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
+                      title="Close tab"
+                    >×</button>
+                  {/if}
+                </button>
+              {/each}
+              <button class="script-tab add-tab" onclick={addNewTab} title="New script">
+                <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px">
+                  <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+                </svg>
+              </button>
             </div>
+
             <div class="console-actions">
+              <!-- Scripts Menu -->
+              <div class="scripts-menu-container">
+                <button
+                  class="btn btn-secondary btn-sm"
+                  onclick={() => showScriptMenu = !showScriptMenu}
+                  title="Scripts menu"
+                >
+                  <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px">
+                    <path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
+                  </svg>
+                  Scripts
+                </button>
+                {#if showScriptMenu}
+                  <div class="scripts-dropdown">
+                    <button class="dropdown-item" onclick={saveCurrentScript}>
+                      <svg viewBox="0 0 20 20" fill="currentColor"><path d="M5.5 13a3.5 3.5 0 01-.369-6.98 4 4 0 117.753-1.977A4.5 4.5 0 1113.5 13H11V9.413l1.293 1.293a1 1 0 001.414-1.414l-3-3a1 1 0 00-1.414 0l-3 3a1 1 0 001.414 1.414L9 9.414V13H5.5z" /><path d="M9 13h2v5a1 1 0 11-2 0v-5z" /></svg>
+                      Save Script
+                      <span class="shortcut">⌘S</span>
+                    </button>
+                    <button class="dropdown-item" onclick={importScriptFromFile}>
+                      <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clip-rule="evenodd" /></svg>
+                      Import from File
+                    </button>
+                    <button class="dropdown-item" onclick={exportCurrentScript}>
+                      <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" /></svg>
+                      Export to File
+                    </button>
+                    {#if savedScripts.length > 0}
+                      <div class="dropdown-divider"></div>
+                      <div class="dropdown-label">Saved Scripts</div>
+                      {#each savedScripts as script}
+                        <div class="dropdown-item-with-actions">
+                          <button class="dropdown-item" onclick={() => openSavedScript(script)}>
+                            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd" /></svg>
+                            {script.name}
+                          </button>
+                          <button class="dropdown-delete" onclick={() => deleteSavedScript(script.id)} title="Delete">
+                            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>
+                          </button>
+                        </div>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+
               <button
                 class="btn btn-sm"
                 class:btn-secondary={!showScriptHelp}
@@ -2002,7 +2523,7 @@
                   Run
                 </button>
               {/if}
-              <button class="btn btn-secondary btn-sm" onclick={() => scriptOutput = []} title="Clear output">
+              <button class="btn btn-secondary btn-sm" onclick={() => updateActiveTab({ output: [] })} title="Clear output">
                 Clear
               </button>
               <button class="console-close-btn" onclick={() => consoleOpen = false} title="Close console (Esc)">
@@ -2113,10 +2634,11 @@ for (let i = 0; i &lt; 10; i++) {'{'}
             {:else}
               <div class="console-editor">
                 <div class="editor-wrapper">
-                  <pre class="syntax-highlight" aria-hidden="true">{@html highlightCode(scriptSource)}<br/></pre>
+                  <pre class="syntax-highlight" aria-hidden="true">{@html highlightCode(getActiveTab()?.source ?? "")}<br/></pre>
                   <textarea
                     class="console-textarea"
-                    bind:value={scriptSource}
+                    value={getActiveTab()?.source ?? ""}
+                    oninput={(e) => updateTabSource(e.currentTarget.value)}
                     placeholder="// JavaScript code... (mem.read, mem.write, ui.print, etc.)"
                     spellcheck="false"
                   ></textarea>
@@ -2126,8 +2648,8 @@ for (let i = 0; i &lt; 10; i++) {'{'}
             <div class="console-output">
               <div class="console-output-header">Output</div>
               <div class="console-output-content" bind:this={consoleOutputEl}>
-                {#if scriptOutput.length > 0}
-                  <pre>{scriptOutput.join('\n')}</pre>
+                {#if (getActiveTab()?.output ?? []).length > 0}
+                  <pre>{(getActiveTab()?.output ?? []).join('\n')}</pre>
                 {:else}
                   <span class="console-placeholder">Script output will appear here...</span>
                 {/if}
@@ -2139,6 +2661,32 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   </main>
   </div>
 </div>
+
+<!-- Toast Container -->
+{#if toasts.length > 0}
+  <div class="toast-container">
+    {#each toasts as toast (toast.id)}
+      <div class="toast toast-{toast.type}">
+        <div class="toast-icon">
+          {#if toast.type === "success"}
+            <svg viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
+            </svg>
+          {:else if toast.type === "error"}
+            <svg viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd" />
+            </svg>
+          {:else}
+            <svg viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+            </svg>
+          {/if}
+        </div>
+        <span class="toast-message">{toast.message}</span>
+      </div>
+    {/each}
+  </div>
+{/if}
 
 <style>
   .app-container {
@@ -2410,6 +2958,7 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   }
 
   .process-item.selected .process-name,
+  .process-item.selected .process-details,
   .process-item.selected .process-pid,
   .process-item.selected .process-icon {
     color: white;
@@ -2451,10 +3000,29 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     text-overflow: ellipsis;
   }
 
-  .process-pid {
-    display: block;
+  .process-details {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  .process-pid {
+    flex-shrink: 0;
+  }
+
+  .process-path {
+    color: var(--text-tertiary);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 120px;
+  }
+
+  .process-item.selected .process-path {
+    color: rgba(255, 255, 255, 0.7);
   }
 
   .empty-state {
@@ -3876,5 +4444,494 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   .help-types > span:last-child {
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  /* Toast notifications */
+  .toast-container {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .toast {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--separator);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    animation: toast-slide-in 0.3s ease-out;
+    min-width: 200px;
+    max-width: 360px;
+  }
+
+  @keyframes toast-slide-in {
+    from {
+      opacity: 0;
+      transform: translateX(100%);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  .toast-icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+  }
+
+  .toast-icon svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .toast-success .toast-icon {
+    color: var(--success);
+  }
+
+  .toast-error .toast-icon {
+    color: var(--danger);
+  }
+
+  .toast-info .toast-icon {
+    color: var(--accent);
+  }
+
+  .toast-message {
+    font-size: 14px;
+    color: var(--text-primary);
+  }
+
+  /* Process pinning */
+  .process-item-wrapper {
+    display: flex;
+    align-items: stretch;
+    position: relative;
+  }
+
+  .process-item-wrapper .process-item {
+    flex: 1;
+    border-radius: var(--radius-md) 0 0 var(--radius-md);
+  }
+
+  .process-item-wrapper.pinned {
+    background: linear-gradient(90deg, rgba(255, 149, 0, 0.1), transparent);
+    border-radius: var(--radius-md);
+  }
+
+  .process-item-wrapper.pinned .process-item {
+    background: transparent;
+  }
+
+  .pin-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    transition: color 0.15s, transform 0.15s;
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
+    opacity: 0;
+  }
+
+  .process-item-wrapper:hover .pin-btn {
+    opacity: 1;
+  }
+
+  .pin-btn:hover {
+    color: var(--warning);
+    transform: scale(1.1);
+  }
+
+  .pin-btn.pinned {
+    opacity: 1;
+    color: var(--warning);
+  }
+
+  .pin-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  /* Value change highlighting */
+  .value-changed {
+    animation: value-flash 1.5s ease-out;
+  }
+
+  @keyframes value-flash {
+    0% {
+      background-color: rgba(34, 197, 94, 0.3);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+
+  .value-display.changed {
+    color: var(--success);
+    font-weight: 600;
+  }
+
+  /* Audit Log Styles */
+  .audit-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    height: 100%;
+  }
+
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .section-header h3 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  .section-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .audit-log-container {
+    flex: 1;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .data-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .data-table th {
+    background: var(--bg-secondary);
+    padding: 12px 16px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .data-table td {
+    padding: 10px 16px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--separator);
+    color: var(--text-primary);
+  }
+
+  .data-table tbody tr:hover td {
+    background: var(--bg-primary);
+  }
+
+  .audit-table {
+    display: block;
+    overflow-y: auto;
+    max-height: 100%;
+  }
+
+  .audit-table thead,
+  .audit-table tbody,
+  .audit-table tr {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  .audit-table tbody {
+    display: block;
+    overflow-y: auto;
+    max-height: calc(100vh - 320px);
+  }
+
+  .audit-entry .timestamp {
+    width: 150px;
+    color: var(--text-secondary);
+    font-family: "SF Mono", "Menlo", monospace;
+    font-size: 12px;
+  }
+
+  .audit-entry .operation {
+    width: 140px;
+  }
+
+  .audit-entry .pid {
+    width: 80px;
+    text-align: center;
+  }
+
+  .audit-entry .address {
+    width: 160px;
+  }
+
+  .audit-entry .details {
+    flex: 1;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .operation-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .operation-badge.read {
+    background: #dbeafe;
+    color: #1d4ed8;
+  }
+
+  .operation-badge.write {
+    background: #fef3c7;
+    color: #92400e;
+  }
+
+  .operation-badge.attach {
+    background: #dcfce7;
+    color: #166534;
+  }
+
+  /* Script Tabs */
+  .script-tabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    padding-right: 12px;
+  }
+
+  .script-tabs::-webkit-scrollbar {
+    height: 4px;
+  }
+
+  .script-tabs::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .script-tabs::-webkit-scrollbar-thumb {
+    background: var(--separator);
+    border-radius: 2px;
+  }
+
+  .script-tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+    max-width: 150px;
+  }
+
+  .script-tab:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .script-tab.active {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  .script-tab.add-tab {
+    padding: 6px 8px;
+    max-width: none;
+  }
+
+  .script-tab.add-tab:hover {
+    color: var(--accent);
+  }
+
+  .tab-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tab-name-input {
+    width: 80px;
+    padding: 2px 4px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    font-size: 12px;
+    background: white;
+    outline: none;
+  }
+
+  .tab-dirty {
+    color: var(--warning);
+    font-size: 10px;
+  }
+
+  .tab-close {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 14px;
+    line-height: 1;
+    opacity: 0;
+    transition: all 0.15s;
+  }
+
+  .script-tab:hover .tab-close {
+    opacity: 1;
+  }
+
+  .tab-close:hover {
+    background: var(--bg-primary);
+    color: var(--danger);
+  }
+
+  /* Scripts Dropdown Menu */
+  .scripts-menu-container {
+    position: relative;
+  }
+
+  .scripts-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    min-width: 200px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--separator);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    z-index: 100;
+    padding: 4px 0;
+  }
+
+  .dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 12px;
+    border: none;
+    background: none;
+    font-size: 13px;
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.15s;
+  }
+
+  .dropdown-item:hover {
+    background: var(--bg-primary);
+  }
+
+  .dropdown-item svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .dropdown-item .shortcut {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+
+  .dropdown-divider {
+    height: 1px;
+    background: var(--separator);
+    margin: 4px 0;
+  }
+
+  .dropdown-label {
+    padding: 6px 12px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .dropdown-item-with-actions {
+    display: flex;
+    align-items: stretch;
+  }
+
+  .dropdown-item-with-actions .dropdown-item {
+    flex: 1;
+  }
+
+  .dropdown-delete {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    border: none;
+    background: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .dropdown-delete:hover {
+    background: #fee2e2;
+    color: var(--danger);
+  }
+
+  .dropdown-delete svg {
+    width: 14px;
+    height: 14px;
   }
 </style>
