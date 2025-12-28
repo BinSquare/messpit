@@ -1,0 +1,26 @@
+{
+  "name": "messpit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.4.2"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5",
+    "@tauri-apps/cli": "^2",
+    "@tsconfig/svelte": "^5",
+    "svelte": "^5",
+    "svelte-check": "^4",
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}

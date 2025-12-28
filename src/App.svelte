@@ -1,0 +1,3880 @@
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { save, open } from "@tauri-apps/plugin-dialog";
+
+  interface ProcessInfo {
+    pid: number;
+    name: string;
+    path: string | null;
+    attachable: boolean;
+  }
+
+  interface AttachResult {
+    pid: number;
+    name: string;
+    arch: string;
+  }
+
+  interface RegionInfo {
+    start: string;
+    size: number;
+    readable: boolean;
+    writable: boolean;
+    executable: boolean;
+  }
+
+  interface ScanResult {
+    address: string;
+    value: string;
+  }
+
+  interface WatchInfo {
+    id: string;
+    address: string;
+    value_type: string;
+    label: string;
+    value: string | null;
+    frozen: boolean;
+  }
+
+  interface ProjectInfo {
+    name: string;
+    path: string | null;
+    watch_count: number;
+    has_unsaved_changes: boolean;
+  }
+
+  interface ScriptRunResult {
+    run_id: string;
+  }
+
+  interface ScriptOutputResult {
+    lines: string[];
+    finished: boolean;
+    error: string | null;
+  }
+
+  interface PatternScanResult {
+    address: string;
+    module: string | null;
+    module_offset: string | null;
+  }
+
+  interface SignatureInfo {
+    id: string;
+    label: string;
+    pattern: string;
+    module: string;
+    offset: number;
+    value_type: string;
+    resolved_address: string | null;
+  }
+
+  // State
+  let processes: ProcessInfo[] = $state([]);
+  let loading = $state(false);
+  let error: string | null = $state(null);
+  let filter = $state("");
+  let showOnlyAttachable = $state(true);  // Default to showing only attachable processes
+  let attachedProcess: AttachResult | null = $state(null);
+  let selectedPid: number | null = $state(null);
+
+  // Tabs
+  let activeTab = $state<"scan" | "watch" | "regions" | "patterns">("scan");
+
+  // Console panel
+  let consoleOpen = $state(false);
+  let consoleHeight = $state(250);
+  let isResizingConsole = $state(false);
+  let consoleOutputEl: HTMLElement | null = $state(null);
+  let showScriptHelp = $state(false);
+
+  // Regions
+  let regions: RegionInfo[] = $state([]);
+  let loadingRegions = $state(false);
+
+  // Scan
+  let scanValueType = $state("i32");
+  let scanValue = $state("");
+  let scanResults: ScanResult[] = $state([]);
+  let scanning = $state(false);
+  let totalScanResults = $state(0);
+  let hasPreviousScan = $state(false);
+  let refineMode = $state("exact");
+
+  // Watch
+  let watches: WatchInfo[] = $state([]);
+  let loadingWatches = $state(false);
+  let watchPollInterval: number | null = $state(null);
+  // Manual entry
+  let showManualEntry = $state(false);
+  let manualAddress = $state("");
+  let manualValueType = $state("i32");
+  let manualLabel = $state("");
+  // Inline editing
+  let editingWatchId: string | null = $state(null);
+  let editingWatchValue = $state("");
+  let editingWatchLabel = $state("");
+
+  // Project
+  let projectInfo: ProjectInfo = $state({ name: "Untitled", path: null, watch_count: 0, has_unsaved_changes: false });
+  let showProjectMenu = $state(false);
+  let editingProjectName = $state(false);
+  let projectNameInput = $state("");
+
+  // Guided Scan Wizard
+  let wizardMode = $state(false);
+  let wizardStep = $state(1);
+  let wizardValueName = $state(""); // e.g., "Health", "Ammo", "Money"
+  let wizardHistory: string[] = $state([]); // Track what user did
+
+  // Script
+  let scriptSource = $state(`// Messpit Script
+// Available API: mem.read, mem.write, watch.add, freeze.set, ui.notify, time.sleep
+
+// Example: Read and print a value
+// const value = mem.read(0x12345678, "i32");
+// ui.print("Value: " + value);
+
+1 + 2 + 3
+`);
+  let scriptRunning = $state(false);
+  let scriptRunId: string | null = $state(null);
+  let scriptOutput: string[] = $state([]);
+  let scriptApiTypes = $state("");
+
+  // Pattern scanning
+  let patternInput = $state("");
+  let patternModule = $state("");
+  let patternResults: PatternScanResult[] = $state([]);
+  let patternScanning = $state(false);
+  let signatures: SignatureInfo[] = $state([]);
+  let showAddSignature = $state(false);
+  let newSigLabel = $state("");
+  let newSigPattern = $state("");
+  let newSigModule = $state("");
+  let newSigOffset = $state("0");
+  let newSigValueType = $state("i32");
+
+  // Toast notifications
+  interface Toast {
+    id: number;
+    message: string;
+    type: "success" | "error" | "info";
+  }
+  let toasts: Toast[] = $state([]);
+  let toastId = 0;
+
+  function showToast(message: string, type: "success" | "error" | "info" = "success") {
+    const id = ++toastId;
+    toasts = [...toasts, { id, message, type }];
+    setTimeout(() => {
+      toasts = toasts.filter(t => t.id !== id);
+    }, 3000);
+  }
+
+  // Pinned processes
+  let pinnedPids: number[] = $state([]);
+
+  function togglePinProcess(pid: number) {
+    if (pinnedPids.includes(pid)) {
+      pinnedPids = pinnedPids.filter(p => p !== pid);
+      showToast("Process unpinned", "info");
+    } else {
+      pinnedPids = [...pinnedPids, pid];
+      showToast("Process pinned", "success");
+    }
+    // Save to localStorage
+    localStorage.setItem("messpit_pinned", JSON.stringify(pinnedPids));
+  }
+
+  // Load pinned processes from localStorage
+  function loadPinnedProcesses() {
+    try {
+      const saved = localStorage.getItem("messpit_pinned");
+      if (saved) {
+        pinnedPids = JSON.parse(saved);
+      }
+    } catch {}
+  }
+
+  // Value change tracking for watch list
+  let previousWatchValues: Map<string, string | null> = $state(new Map());
+  let changedWatchIds: Set<string> = $state(new Set());
+
+  async function loadProcesses() {
+    loading = true;
+    error = null;
+    try {
+      processes = await invoke<ProcessInfo[]>("list_processes_cmd");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function attachToProcess(pid: number) {
+    error = null;
+    try {
+      attachedProcess = await invoke<AttachResult>("attach_process", { pid });
+      selectedPid = pid;
+      loadRegions();
+      startWatchPolling();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function detach() {
+    error = null;
+    try {
+      stopWatchPolling();
+      await invoke("detach_process");
+      attachedProcess = null;
+      selectedPid = null;
+      regions = [];
+      scanResults = [];
+      hasPreviousScan = false;
+      totalScanResults = 0;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function loadRegions() {
+    loadingRegions = true;
+    error = null;
+    try {
+      regions = await invoke<RegionInfo[]>("get_regions");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      loadingRegions = false;
+    }
+  }
+
+  async function startScan() {
+    if (!scanValue.trim()) {
+      error = "Please enter a value to search for";
+      return;
+    }
+
+    scanning = true;
+    error = null;
+    scanResults = [];
+
+    try {
+      scanResults = await invoke<ScanResult[]>("start_scan", {
+        request: {
+          value_type: scanValueType,
+          comparison: "exact",
+          value: scanValue.trim()
+        }
+      });
+      totalScanResults = await invoke<number>("get_scan_count");
+      hasPreviousScan = true;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function refineScan() {
+    scanning = true;
+    error = null;
+
+    try {
+      scanResults = await invoke<ScanResult[]>("refine_scan", {
+        request: {
+          mode: refineMode,
+          value: refineMode === "exact" ? scanValue.trim() || null : null
+        }
+      });
+      totalScanResults = await invoke<number>("get_scan_count");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function clearScan() {
+    await invoke("clear_scan");
+    scanResults = [];
+    hasPreviousScan = false;
+    totalScanResults = 0;
+    scanValue = "";
+  }
+
+  async function addToWatch(address: string, value: string) {
+    try {
+      await invoke("add_watch", {
+        request: {
+          address,
+          value_type: scanValueType,
+          label: `${address.slice(-8)}`
+        }
+      });
+      await loadWatches();
+      activeTab = "watch";
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function loadWatches() {
+    loadingWatches = true;
+    try {
+      watches = await invoke<WatchInfo[]>("get_watches");
+    } catch (e) {
+      // Silently handle watch load errors during polling
+    } finally {
+      loadingWatches = false;
+    }
+  }
+
+  async function removeWatch(id: string) {
+    try {
+      await invoke("remove_watch", { entryId: id });
+      await loadWatches();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function toggleFreeze(watch: WatchInfo) {
+    try {
+      await invoke("toggle_freeze", {
+        request: {
+          entry_id: watch.id,
+          value: watch.value || "0"
+        }
+      });
+      await loadWatches();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function startWatchPolling() {
+    stopWatchPolling();
+    loadWatches();
+    watchPollInterval = setInterval(loadWatches, 500) as unknown as number;
+  }
+
+  function stopWatchPolling() {
+    if (watchPollInterval !== null) {
+      clearInterval(watchPollInterval);
+      watchPollInterval = null;
+    }
+  }
+
+  // Manual watch entry
+  async function addManualWatch() {
+    if (!manualAddress.trim()) {
+      error = "Please enter an address";
+      return;
+    }
+
+    try {
+      await invoke<string>("add_watch", {
+        request: {
+          address: manualAddress.trim(),
+          value_type: manualValueType,
+          label: manualLabel.trim() || `Manual_${manualAddress.slice(-8)}`
+        }
+      });
+      await loadWatches();
+      // Reset form
+      manualAddress = "";
+      manualLabel = "";
+      showManualEntry = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Inline editing
+  function startEditingWatch(watch: WatchInfo) {
+    editingWatchId = watch.id;
+    editingWatchValue = watch.value || "";
+    editingWatchLabel = watch.label;
+  }
+
+  function cancelEditingWatch() {
+    editingWatchId = null;
+    editingWatchValue = "";
+    editingWatchLabel = "";
+  }
+
+  async function writeWatchValue(watch: WatchInfo) {
+    if (!attachedProcess) {
+      error = "No process attached - cannot write to memory";
+      return;
+    }
+
+    if (!editingWatchValue.trim()) {
+      error = "Please enter a value";
+      return;
+    }
+
+    try {
+      await invoke("write_value", {
+        request: {
+          address: watch.address,
+          value_type: watch.value_type,
+          value: editingWatchValue.trim()
+        }
+      });
+      await loadWatches();
+      cancelEditingWatch();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function readSingleValue(address: string, valueType: string): Promise<string | null> {
+    if (!attachedProcess) return null;
+    try {
+      return await invoke<string | null>("read_value", {
+        request: { address, value_type: valueType }
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  // Project management
+  async function loadProjectInfo() {
+    try {
+      projectInfo = await invoke<ProjectInfo>("get_project_info");
+    } catch (e) {
+      // Ignore errors loading project info
+    }
+  }
+
+  async function newProject() {
+    const name = prompt("Enter project name:", "New Project");
+    if (name) {
+      try {
+        projectInfo = await invoke<ProjectInfo>("new_project", { name });
+        watches = [];
+        showProjectMenu = false;
+      } catch (e) {
+        error = String(e);
+      }
+    }
+  }
+
+  async function saveProject() {
+    try {
+      let filePath = projectInfo.path;
+
+      if (!filePath) {
+        const selected = await save({
+          filters: [{ name: "Messpit Project", extensions: ["messpit"] }],
+          defaultPath: `${projectInfo.name}.messpit`
+        });
+        if (!selected) return;
+        filePath = selected;
+      }
+
+      await invoke("save_project", { filePath });
+      await loadProjectInfo();
+      showProjectMenu = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function saveProjectAs() {
+    try {
+      const selected = await save({
+        filters: [{ name: "Messpit Project", extensions: ["messpit"] }],
+        defaultPath: `${projectInfo.name}.messpit`
+      });
+      if (!selected) return;
+
+      await invoke("save_project", { filePath: selected });
+      await loadProjectInfo();
+      showProjectMenu = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function openProject() {
+    try {
+      const selected = await open({
+        filters: [{ name: "Messpit Project", extensions: ["messpit"] }],
+        multiple: false
+      });
+      if (!selected) return;
+
+      projectInfo = await invoke<ProjectInfo>("load_project", { filePath: selected });
+      await loadWatches();
+      showProjectMenu = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function exportProject() {
+    try {
+      const selected = await save({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        defaultPath: `${projectInfo.name}_export.json`
+      });
+      if (!selected) return;
+
+      await invoke("export_project", { filePath: selected });
+      showProjectMenu = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function importProject() {
+    try {
+      const selected = await open({
+        filters: [{ name: "JSON", extensions: ["json", "messpit"] }],
+        multiple: false
+      });
+      if (!selected) return;
+
+      projectInfo = await invoke<ProjectInfo>("import_project", { filePath: selected });
+      await loadWatches();
+      showProjectMenu = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function startEditingProjectName() {
+    projectNameInput = projectInfo.name;
+    editingProjectName = true;
+  }
+
+  async function saveProjectName() {
+    if (projectNameInput.trim()) {
+      await invoke("set_project_name", { name: projectNameInput.trim() });
+      await loadProjectInfo();
+    }
+    editingProjectName = false;
+  }
+
+  // Script functions
+  async function runScript() {
+    if (scriptRunning) return;
+
+    scriptRunning = true;
+    scriptOutput = [];
+    error = null;
+
+    try {
+      const result = await invoke<ScriptRunResult>("run_script", { source: scriptSource });
+      scriptRunId = result.run_id;
+
+      // Get the output
+      const output = await invoke<ScriptOutputResult>("get_script_output", { runId: result.run_id });
+      scriptOutput = output.lines;
+    } catch (e) {
+      error = String(e);
+      scriptOutput = [`Error: ${e}`];
+    } finally {
+      scriptRunning = false;
+    }
+  }
+
+  async function cancelScript() {
+    if (!scriptRunId) return;
+
+    try {
+      await invoke("cancel_script", { runId: scriptRunId });
+      scriptOutput = [...scriptOutput, "Script cancelled."];
+    } catch (e) {
+      // Script may have already finished
+    }
+    scriptRunning = false;
+  }
+
+  async function loadScriptApiTypes() {
+    try {
+      scriptApiTypes = await invoke<string>("get_script_api_types");
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  // Pattern scanning functions
+  async function runPatternScan() {
+    if (!patternInput.trim()) {
+      error = "Please enter a pattern";
+      return;
+    }
+
+    patternScanning = true;
+    error = null;
+
+    try {
+      patternResults = await invoke<PatternScanResult[]>("pattern_scan", {
+        request: {
+          pattern: patternInput.trim(),
+          module: patternModule.trim() || null,
+          use_simd: true,
+        },
+      });
+    } catch (e) {
+      error = String(e);
+      patternResults = [];
+    } finally {
+      patternScanning = false;
+    }
+  }
+
+  async function loadSignatures() {
+    try {
+      signatures = await invoke<SignatureInfo[]>("get_signatures");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function addSignature() {
+    if (!newSigLabel.trim() || !newSigPattern.trim() || !newSigModule.trim()) {
+      error = "Please fill in all required fields";
+      return;
+    }
+
+    try {
+      await invoke<string>("add_signature", {
+        request: {
+          label: newSigLabel.trim(),
+          pattern: newSigPattern.trim(),
+          module: newSigModule.trim(),
+          offset: parseInt(newSigOffset) || 0,
+          value_type: newSigValueType,
+        },
+      });
+      await loadSignatures();
+      showAddSignature = false;
+      newSigLabel = "";
+      newSigPattern = "";
+      newSigModule = "";
+      newSigOffset = "0";
+      newSigValueType = "i32";
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function removeSignature(sigId: string) {
+    try {
+      await invoke("remove_signature", { sigId });
+      await loadSignatures();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function watchFromSignature(sigId: string) {
+    try {
+      await invoke<string>("watch_from_signature", { sigId });
+      await loadWatches();
+      activeTab = "watch";
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function promoteToSignature(result: PatternScanResult) {
+    showAddSignature = true;
+    newSigPattern = patternInput;
+    newSigModule = result.module || "";
+    newSigLabel = `Sig_${result.address.slice(-8)}`;
+    newSigOffset = "0";
+  }
+
+  // Wizard functions
+  function startWizard() {
+    wizardMode = true;
+    wizardStep = 1;
+    wizardValueName = "";
+    wizardHistory = [];
+    hasPreviousScan = false;
+    scanResults = [];
+    totalScanResults = 0;
+    scanValue = "";
+  }
+
+  function exitWizard() {
+    wizardMode = false;
+    wizardStep = 1;
+  }
+
+  async function wizardFirstScan() {
+    if (!scanValue.trim()) {
+      error = "Please enter the current value";
+      return;
+    }
+
+    wizardHistory = [...wizardHistory, `First scan for value: ${scanValue}`];
+    await startScan();
+
+    if (totalScanResults > 0) {
+      wizardStep = 2;
+    }
+  }
+
+  async function wizardRefine(mode: string) {
+    refineMode = mode;
+
+    if (mode === "exact" && !scanValue.trim()) {
+      error = "Please enter the new value";
+      return;
+    }
+
+    const action = mode === "exact" ? `Refined to exact value: ${scanValue}` :
+                   mode === "changed" ? "Refined: value changed" :
+                   mode === "unchanged" ? "Refined: value unchanged" :
+                   mode === "increased" ? "Refined: value increased" :
+                   mode === "decreased" ? "Refined: value decreased" : `Refined: ${mode}`;
+
+    wizardHistory = [...wizardHistory, action];
+    await refineScan();
+
+    // Check if we found it
+    if (totalScanResults <= 10 && totalScanResults > 0) {
+      wizardStep = 3;
+    }
+  }
+
+  async function wizardAddToWatch(address: string, value: string) {
+    const label = wizardValueName || address.slice(-8);
+    await addToWatch(address, value);
+    wizardHistory = [...wizardHistory, `Added ${label} to watch list`];
+    wizardStep = 4;
+  }
+
+  function wizardReset() {
+    clearScan();
+    wizardStep = 1;
+    wizardHistory = [];
+    scanValue = "";
+  }
+
+  function formatSize(bytes: number): string {
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${bytes} B`;
+  }
+
+  function dismissError() {
+    error = null;
+  }
+
+  const filteredProcesses = $derived(
+    processes.filter((p) => {
+      // Apply text filter
+      const matchesText = p.name.toLowerCase().includes(filter.toLowerCase()) ||
+        p.pid.toString().includes(filter);
+
+      // Apply attachable filter
+      const matchesAttachable = !showOnlyAttachable || p.attachable === true;
+
+      return matchesText && matchesAttachable;
+    })
+  );
+
+  const writableRegions = $derived(
+    regions.filter(r => r.writable && r.readable)
+  );
+
+  // Console resize handlers
+  function startConsoleResize(e: MouseEvent) {
+    e.preventDefault();
+    isResizingConsole = true;
+    document.addEventListener('mousemove', handleConsoleResize);
+    document.addEventListener('mouseup', stopConsoleResize);
+  }
+
+  function handleConsoleResize(e: MouseEvent) {
+    if (!isResizingConsole) return;
+    const mainContent = document.querySelector('.main-content');
+    if (!mainContent) return;
+    const rect = mainContent.getBoundingClientRect();
+    const newHeight = rect.bottom - e.clientY;
+    consoleHeight = Math.max(150, Math.min(newHeight, window.innerHeight * 0.7));
+  }
+
+  function stopConsoleResize() {
+    isResizingConsole = false;
+    document.removeEventListener('mousemove', handleConsoleResize);
+    document.removeEventListener('mouseup', stopConsoleResize);
+  }
+
+  // Keyboard shortcut handler
+  function handleKeydown(e: KeyboardEvent) {
+    // Ctrl/Cmd + ` to toggle console
+    if ((e.ctrlKey || e.metaKey) && e.key === '`') {
+      e.preventDefault();
+      consoleOpen = !consoleOpen;
+      if (consoleOpen) loadScriptApiTypes();
+    }
+    // Escape to close console when open
+    if (e.key === 'Escape' && consoleOpen) {
+      consoleOpen = false;
+    }
+  }
+
+  // Simple syntax highlighting for JavaScript
+  function highlightCode(code: string): string {
+    const keywords = /\b(const|let|var|function|return|if|else|for|while|async|await|try|catch|throw|new|class|extends|import|export|from|true|false|null|undefined)\b/g;
+    const strings = /(["'`])(?:(?!\1)[^\\]|\\.)*?\1/g;
+    const comments = /(\/\/.*$|\/\*[\s\S]*?\*\/)/gm;
+    const numbers = /\b(\d+\.?\d*)\b/g;
+    const functions = /\b([a-zA-Z_]\w*)\s*(?=\()/g;
+
+    let highlighted = code
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // Order matters - comments first, then strings, then others
+    highlighted = highlighted
+      .replace(comments, '<span class="hl-comment">$1</span>')
+      .replace(strings, '<span class="hl-string">$&</span>')
+      .replace(keywords, '<span class="hl-keyword">$1</span>')
+      .replace(numbers, '<span class="hl-number">$1</span>')
+      .replace(functions, '<span class="hl-function">$1</span>');
+
+    return highlighted;
+  }
+
+  // Auto-scroll output to bottom
+  $effect(() => {
+    if (consoleOutputEl && scriptOutput.length > 0) {
+      consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
+    }
+  });
+
+  $effect(() => {
+    loadProcesses();
+    loadProjectInfo();
+    return () => stopWatchPolling();
+  });
+</script>
+
+<svelte:window onkeydown={handleKeydown} />
+
+<div class="app-container">
+  <!-- Top Menu Bar -->
+  <div class="top-menu-bar">
+    <div class="menu-bar-left">
+      <h1 class="app-title">Messpit</h1>
+      <div class="menu-bar-divider"></div>
+      <div class="project-name-container">
+        {#if editingProjectName}
+          <input
+            type="text"
+            class="project-name-input-inline"
+            bind:value={projectNameInput}
+            onkeydown={(e) => e.key === 'Enter' && saveProjectName()}
+            onblur={saveProjectName}
+          />
+        {:else}
+          <button class="project-name-btn" onclick={startEditingProjectName} title="Click to rename">
+            {projectInfo.name}
+          </button>
+        {/if}
+        {#if projectInfo.path}
+          <span class="saved-dot" title={projectInfo.path}></span>
+        {:else}
+          <span class="unsaved-dot" title="Unsaved"></span>
+        {/if}
+      </div>
+    </div>
+    <div class="menu-bar-actions">
+      <button class="menu-bar-btn" onclick={newProject} title="New Project">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
+        New
+      </button>
+      <button class="menu-bar-btn" onclick={openProject} title="Open Project">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" clip-rule="evenodd" /></svg>
+        Open
+      </button>
+      <div class="menu-bar-divider"></div>
+      <button class="menu-bar-btn" onclick={saveProject} title="Save Project">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path d="M7.707 10.293a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 11.586V6h5a2 2 0 012 2v7a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2h5v5.586l-1.293-1.293zM9 4a1 1 0 012 0v2H9V4z" /></svg>
+        Save
+      </button>
+      <button class="menu-bar-btn" onclick={saveProjectAs} title="Save As...">
+        Save As
+      </button>
+      <div class="menu-bar-divider"></div>
+      <button class="menu-bar-btn" onclick={exportProject} title="Export as JSON">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" /></svg>
+        Export
+      </button>
+      <button class="menu-bar-btn" onclick={importProject} title="Import from JSON">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clip-rule="evenodd" /></svg>
+        Import
+      </button>
+    </div>
+  </div>
+
+  <!-- Main Content Area -->
+  <div class="app-content">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="search-container">
+      <svg class="search-icon" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd" />
+      </svg>
+      <input
+        type="text"
+        placeholder="Search processes..."
+        bind:value={filter}
+        class="search-input"
+      />
+    </div>
+
+    <div class="process-list-header">
+      <span class="section-label">Processes</span>
+      <button class="icon-button" onclick={loadProcesses} disabled={loading} title="Refresh">
+        <svg class="refresh-icon" class:spinning={loading} viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+        </svg>
+      </button>
+    </div>
+
+    <label class="filter-checkbox" title="Show only processes that can be attached to (not hardened)">
+      <input type="checkbox" bind:checked={showOnlyAttachable} />
+      <span>Attachable only</span>
+    </label>
+
+    <div class="process-list">
+      {#each filteredProcesses as proc (proc.pid)}
+        <button
+          class="process-item"
+          class:selected={selectedPid === proc.pid}
+          onclick={() => attachToProcess(proc.pid)}
+          type="button"
+        >
+          <div class="process-icon" class:attachable-icon={proc.attachable}>
+            <svg viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+            </svg>
+          </div>
+          <div class="process-info">
+            <span class="process-name">{proc.name}</span>
+            <span class="process-pid">PID {proc.pid} | attachable={String(proc.attachable)} | type={typeof proc.attachable}</span>
+          </div>
+        </button>
+      {:else}
+        <div class="empty-state">
+          {#if loading}
+            <div class="loading-spinner"></div>
+            <span>Loading processes...</span>
+          {:else}
+            <span>No processes found</span>
+          {/if}
+        </div>
+      {/each}
+    </div>
+
+    <div class="sidebar-footer">
+      <span class="process-count">{filteredProcesses.length} of {processes.length}</span>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    {#if error}
+      <div class="error-banner">
+        <svg viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
+        </svg>
+        <span>{error}</span>
+        <button class="dismiss-btn" onclick={dismissError} title="Dismiss error">
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+          </svg>
+        </button>
+      </div>
+    {/if}
+
+    {#if attachedProcess}
+      <!-- Connected state -->
+      <div class="connected-header">
+        <div class="connection-badge">
+          <div class="pulse-dot"></div>
+          <span>Connected</span>
+        </div>
+        <div class="connected-info">
+          <h2>{attachedProcess.name}</h2>
+          <p>PID {attachedProcess.pid} · {attachedProcess.arch}</p>
+        </div>
+        <button class="btn btn-secondary" onclick={detach} title="Detach from process">
+          Disconnect
+        </button>
+      </div>
+    {:else}
+      <!-- Disconnected state -->
+      <div class="disconnected-header">
+        <span class="disconnected-badge">No Process</span>
+        <span class="disconnected-hint">Select a process from the sidebar, or use Watch tab to manage addresses</span>
+      </div>
+    {/if}
+
+      <!-- Tab Navigation (always visible) -->
+      <div class="tab-bar">
+        <button
+          class="tab-item"
+          class:active={activeTab === "scan"}
+          onclick={() => activeTab = "scan"}
+          type="button"
+          title="Search for values in memory"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd" />
+          </svg>
+          Scanner
+          {#if totalScanResults > 0}
+            <span class="badge">{totalScanResults > 1000 ? "1000+" : totalScanResults}</span>
+          {/if}
+        </button>
+        <button
+          class="tab-item"
+          class:active={activeTab === "watch"}
+          onclick={() => { activeTab = "watch"; loadWatches(); }}
+          type="button"
+          title="Monitor and edit memory addresses"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path d="M10 12a2 2 0 100-4 2 2 0 000 4z" />
+            <path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd" />
+          </svg>
+          Watch
+          {#if watches.length > 0}
+            <span class="badge">{watches.length}</span>
+          {/if}
+        </button>
+        <button
+          class="tab-item"
+          class:active={activeTab === "regions"}
+          onclick={() => { activeTab = "regions"; loadRegions(); }}
+          type="button"
+          title="View process memory regions"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z" />
+          </svg>
+          Memory
+        </button>
+        <button
+          class="tab-item"
+          class:active={activeTab === "patterns"}
+          onclick={() => { activeTab = "patterns"; loadSignatures(); }}
+          type="button"
+          title="Scan for byte patterns and manage signatures"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
+          </svg>
+          Patterns
+          {#if signatures.length > 0}
+            <span class="badge">{signatures.length}</span>
+          {/if}
+        </button>
+        <!-- Console toggle on the right side of tab bar -->
+        <div class="tab-spacer"></div>
+        <button
+          class="tab-item console-toggle"
+          class:active={consoleOpen}
+          onclick={() => { consoleOpen = !consoleOpen; if (consoleOpen) loadScriptApiTypes(); }}
+          type="button"
+          title="Toggle script console"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414zM11 12a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" />
+          </svg>
+          Console
+          {#if scriptRunning}
+            <div class="btn-spinner-small"></div>
+          {/if}
+        </button>
+      </div>
+
+      <!-- Tab Content -->
+      <div class="tab-content">
+        {#if activeTab === "scan"}
+          <div class="scan-panel">
+            {#if !attachedProcess}
+              <div class="requires-process">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 002.25-2.25V6.75a2.25 2.25 0 00-2.25-2.25H6.75A2.25 2.25 0 004.5 6.75v10.5a2.25 2.25 0 002.25 2.25z" />
+                </svg>
+                <h3>Process Required</h3>
+                <p>Select a process from the sidebar to scan its memory</p>
+              </div>
+            {:else if wizardMode}
+              <!-- Guided Scan Wizard -->
+              <div class="wizard-container">
+                <div class="wizard-header">
+                  <div class="wizard-title">
+                    <h3>Guided Scan Wizard</h3>
+                    <span class="wizard-step-indicator">Step {wizardStep} of 4</span>
+                  </div>
+                  <button class="btn btn-sm btn-secondary" onclick={exitWizard}>
+                    Exit Wizard
+                  </button>
+                </div>
+
+                <div class="wizard-progress">
+                  <div class="wizard-progress-bar" style="width: {wizardStep * 25}%"></div>
+                </div>
+
+                <div class="wizard-content">
+                  {#if wizardStep === 1}
+                    <!-- Step 1: Initial Setup -->
+                    <div class="wizard-step">
+                      <div class="wizard-step-header">
+                        <span class="wizard-step-number">1</span>
+                        <div>
+                          <h4>What are you looking for?</h4>
+                          <p>Enter the current value you see in the game</p>
+                        </div>
+                      </div>
+
+                      <div class="wizard-form">
+                        <div class="form-group">
+                          <label class="form-label">Name (optional)</label>
+                          <input
+                            type="text"
+                            class="form-input"
+                            placeholder="e.g., Health, Ammo, Money..."
+                            bind:value={wizardValueName}
+                          />
+                        </div>
+
+                        <div class="form-row">
+                          <div class="form-group">
+                            <label class="form-label">Value Type</label>
+                            <select class="form-select" bind:value={scanValueType}>
+                              <option value="i32">Integer (most common)</option>
+                              <option value="f32">Decimal (Float)</option>
+                              <option value="f64">Decimal (Double)</option>
+                              <option value="i64">Large Integer</option>
+                            </select>
+                          </div>
+                          <div class="form-group flex-1">
+                            <label class="form-label">Current Value</label>
+                            <input
+                              type="text"
+                              class="form-input"
+                              placeholder="e.g., 100"
+                              bind:value={scanValue}
+                              onkeydown={(e) => e.key === 'Enter' && wizardFirstScan()}
+                            />
+                          </div>
+                        </div>
+
+                        <div class="wizard-tip">
+                          <strong>Tip:</strong> Look at the game and note the exact value (e.g., if health shows "100", enter 100)
+                        </div>
+
+                        <button class="btn btn-primary btn-lg" onclick={wizardFirstScan} disabled={scanning}>
+                          {#if scanning}
+                            <div class="btn-spinner"></div>
+                            Scanning...
+                          {:else}
+                            Start Scanning
+                          {/if}
+                        </button>
+                      </div>
+                    </div>
+                  {:else if wizardStep === 2}
+                    <!-- Step 2: Refine -->
+                    <div class="wizard-step">
+                      <div class="wizard-step-header">
+                        <span class="wizard-step-number">2</span>
+                        <div>
+                          <h4>Narrow down the results</h4>
+                          <p>Found {totalScanResults.toLocaleString()} possible addresses</p>
+                        </div>
+                      </div>
+
+                      <div class="wizard-form">
+                        <div class="wizard-instruction">
+                          <strong>Now change the value in the game</strong> (e.g., take damage, spend money, use ammo)
+                        </div>
+
+                        <div class="wizard-refine-options">
+                          <div class="refine-option" onclick={() => wizardRefine("changed")}>
+                            <div class="refine-option-icon">↕</div>
+                            <div class="refine-option-text">
+                              <strong>Value Changed</strong>
+                              <span>I changed the value but don't know the new amount</span>
+                            </div>
+                          </div>
+
+                          <div class="refine-option" onclick={() => wizardRefine("decreased")}>
+                            <div class="refine-option-icon">↓</div>
+                            <div class="refine-option-text">
+                              <strong>Value Decreased</strong>
+                              <span>The value went down (took damage, spent money)</span>
+                            </div>
+                          </div>
+
+                          <div class="refine-option" onclick={() => wizardRefine("increased")}>
+                            <div class="refine-option-icon">↑</div>
+                            <div class="refine-option-text">
+                              <strong>Value Increased</strong>
+                              <span>The value went up (healed, earned money)</span>
+                            </div>
+                          </div>
+
+                          <div class="refine-option exact-option">
+                            <div class="refine-option-icon">=</div>
+                            <div class="refine-option-text flex-1">
+                              <strong>I know the exact new value</strong>
+                              <input
+                                type="text"
+                                class="form-input mt-8"
+                                placeholder="Enter new value..."
+                                bind:value={scanValue}
+                                onkeydown={(e) => e.key === 'Enter' && wizardRefine("exact")}
+                              />
+                            </div>
+                            <button class="btn btn-primary" onclick={() => wizardRefine("exact")} disabled={scanning}>
+                              {scanning ? "..." : "Scan"}
+                            </button>
+                          </div>
+                        </div>
+
+                        <div class="wizard-tip">
+                          <strong>Tip:</strong> Keep refining until you have fewer than 10 results
+                        </div>
+
+                        <button class="btn btn-secondary" onclick={wizardReset}>
+                          Start Over
+                        </button>
+                      </div>
+                    </div>
+                  {:else if wizardStep === 3}
+                    <!-- Step 3: Select Result -->
+                    <div class="wizard-step">
+                      <div class="wizard-step-header">
+                        <span class="wizard-step-number">3</span>
+                        <div>
+                          <h4>Select the correct address</h4>
+                          <p>Found {totalScanResults} potential matches</p>
+                        </div>
+                      </div>
+
+                      <div class="wizard-results">
+                        {#each scanResults as result (result.address)}
+                          <div class="wizard-result-item" onclick={() => wizardAddToWatch(result.address, result.value)}>
+                            <div class="wizard-result-info">
+                              <span class="mono">{result.address}</span>
+                              <span class="wizard-result-value">{result.value}</span>
+                            </div>
+                            <button class="btn btn-primary btn-sm">
+                              Select This
+                            </button>
+                          </div>
+                        {/each}
+                      </div>
+
+                      <div class="wizard-tip">
+                        <strong>Tip:</strong> If unsure, try changing the value in-game and watch which address updates
+                      </div>
+
+                      <div class="wizard-actions">
+                        <button class="btn btn-secondary" onclick={() => wizardStep = 2}>
+                          Continue Refining
+                        </button>
+                      </div>
+                    </div>
+                  {:else if wizardStep === 4}
+                    <!-- Step 4: Success -->
+                    <div class="wizard-step wizard-success">
+                      <div class="wizard-success-icon">✓</div>
+                      <h4>Success!</h4>
+                      <p>The address has been added to your Watch List</p>
+
+                      <div class="wizard-next-steps">
+                        <p><strong>What's next?</strong></p>
+                        <ul>
+                          <li>Go to the <strong>Watch</strong> tab to see your value</li>
+                          <li>Click the <strong>freeze</strong> button to lock the value</li>
+                          <li>Double-click to edit the value directly</li>
+                        </ul>
+                      </div>
+
+                      <div class="wizard-actions">
+                        <button class="btn btn-primary" onclick={() => { activeTab = "watch"; exitWizard(); }}>
+                          Go to Watch List
+                        </button>
+                        <button class="btn btn-secondary" onclick={wizardReset}>
+                          Find Another Value
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+
+                <!-- History sidebar -->
+                {#if wizardHistory.length > 0}
+                  <div class="wizard-history">
+                    <h5>History</h5>
+                    {#each wizardHistory as item, i}
+                      <div class="wizard-history-item">{i + 1}. {item}</div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {:else}
+              <!-- Regular Scan Mode -->
+              <div class="card">
+                <div class="card-header">
+                  <h3>{hasPreviousScan ? "Refine Scan" : "New Scan"}</h3>
+                  <div class="header-actions">
+                    {#if !hasPreviousScan}
+                      <button class="btn btn-sm btn-accent" onclick={startWizard} title="Step-by-step wizard for beginners">
+                        <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px;margin-right:4px">
+                          <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-3a1 1 0 00-.867.5 1 1 0 11-1.731-1A3 3 0 0113 8a3.001 3.001 0 01-2 2.83V11a1 1 0 11-2 0v-1a1 1 0 011-1 1 1 0 100-2zm0 8a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd" />
+                        </svg>
+                        Guided Mode
+                      </button>
+                    {/if}
+                    {#if hasPreviousScan}
+                      <button class="btn btn-sm btn-secondary" onclick={clearScan} title="Clear results and start fresh">
+                        New Scan
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+                <div class="card-body">
+                  {#if !hasPreviousScan}
+                    <div class="form-row">
+                      <div class="form-group">
+                        <label class="form-label">Type</label>
+                        <select class="form-select" bind:value={scanValueType}>
+                          <option value="i32">Int32</option>
+                          <option value="i64">Int64</option>
+                          <option value="u32">UInt32</option>
+                          <option value="u64">UInt64</option>
+                          <option value="f32">Float</option>
+                          <option value="f64">Double</option>
+                        </select>
+                      </div>
+                      <div class="form-group flex-1">
+                        <label class="form-label">Value</label>
+                        <input
+                          type="text"
+                          class="form-input"
+                          placeholder="Enter value to find..."
+                          bind:value={scanValue}
+                          onkeydown={(e) => e.key === 'Enter' && startScan()}
+                        />
+                      </div>
+                      <div class="form-group">
+                        <label class="form-label">&nbsp;</label>
+                        <button class="btn btn-primary" onclick={startScan} disabled={scanning}>
+                          {#if scanning}
+                            <div class="btn-spinner"></div>
+                            Scanning...
+                          {:else}
+                            First Scan
+                          {/if}
+                        </button>
+                      </div>
+                    </div>
+                  {:else}
+                  <div class="refine-section">
+                    <div class="refine-modes">
+                      <button
+                        class="refine-btn"
+                        class:active={refineMode === "changed"}
+                        onclick={() => refineMode = "changed"}
+                        title="Keep addresses where value changed"
+                      >
+                        Changed
+                      </button>
+                      <button
+                        class="refine-btn"
+                        class:active={refineMode === "unchanged"}
+                        onclick={() => refineMode = "unchanged"}
+                        title="Keep addresses where value stayed the same"
+                      >
+                        Unchanged
+                      </button>
+                      <button
+                        class="refine-btn"
+                        class:active={refineMode === "increased"}
+                        onclick={() => refineMode = "increased"}
+                        title="Keep addresses where value went up"
+                      >
+                        Increased
+                      </button>
+                      <button
+                        class="refine-btn"
+                        class:active={refineMode === "decreased"}
+                        onclick={() => refineMode = "decreased"}
+                        title="Keep addresses where value went down"
+                      >
+                        Decreased
+                      </button>
+                      <button
+                        class="refine-btn"
+                        class:active={refineMode === "exact"}
+                        onclick={() => refineMode = "exact"}
+                        title="Keep addresses matching a specific value"
+                      >
+                        Exact Value
+                      </button>
+                    </div>
+                    {#if refineMode === "exact"}
+                      <div class="form-row mt-12">
+                        <div class="form-group flex-1">
+                          <input
+                            type="text"
+                            class="form-input"
+                            placeholder="Enter new value..."
+                            bind:value={scanValue}
+                            onkeydown={(e) => e.key === 'Enter' && refineScan()}
+                          />
+                        </div>
+                        <button class="btn btn-primary" onclick={refineScan} disabled={scanning}>
+                          {#if scanning}
+                            <div class="btn-spinner"></div>
+                            Refining...
+                          {:else}
+                            Next Scan
+                          {/if}
+                        </button>
+                      </div>
+                    {:else}
+                      <div class="form-row mt-12">
+                        <button class="btn btn-primary flex-1" onclick={refineScan} disabled={scanning}>
+                          {#if scanning}
+                            <div class="btn-spinner"></div>
+                            Refining...
+                          {:else}
+                            Next Scan
+                          {/if}
+                        </button>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            </div>
+
+            <div class="card flex-1">
+              <div class="card-header">
+                <h3>Results</h3>
+                <span class="results-count">
+                  {totalScanResults}{totalScanResults >= 1000 ? "+" : ""} found
+                  {#if scanResults.length < totalScanResults}
+                    (showing {scanResults.length})
+                  {/if}
+                </span>
+              </div>
+              <div class="results-table-container">
+                {#if scanResults.length > 0}
+                  <table class="results-table">
+                    <thead>
+                      <tr>
+                        <th>Address</th>
+                        <th>Value</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each scanResults as result (result.address)}
+                        <tr>
+                          <td class="mono">{result.address}</td>
+                          <td class="value-cell">{result.value}</td>
+                          <td class="actions-cell">
+                            <button
+                              class="action-btn"
+                              title="Add to watch list"
+                              onclick={() => addToWatch(result.address, result.value)}
+                            >
+                              <svg viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M10 12a2 2 0 100-4 2 2 0 000 4z" />
+                                <path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd" />
+                              </svg>
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {:else}
+                  <div class="empty-results">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+                    </svg>
+                    <p>No results yet</p>
+                    <span>Enter a value and click First Scan to find memory addresses</span>
+                  </div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+          </div>
+        {:else if activeTab === "watch"}
+          <div class="watch-panel">
+            <!-- Manual Entry Card -->
+            <div class="card">
+              <div class="card-header">
+                <h3>Add Watch Entry</h3>
+                <button class="btn btn-sm btn-secondary" onclick={() => showManualEntry = !showManualEntry} title={showManualEntry ? "Cancel manual entry" : "Manually add an address to watch"}>
+                  {showManualEntry ? "Cancel" : "+ Add Manual"}
+                </button>
+              </div>
+              {#if showManualEntry}
+                <div class="card-body manual-entry-form">
+                  <div class="form-row">
+                    <div class="form-group flex-1">
+                      <label class="form-label" for="manual-address">Address</label>
+                      <input
+                        id="manual-address"
+                        type="text"
+                        class="form-input mono"
+                        bind:value={manualAddress}
+                        placeholder="0x12345678"
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="manual-type">Type</label>
+                      <select id="manual-type" class="form-select" bind:value={manualValueType}>
+                        <option value="i32">Int32</option>
+                        <option value="i64">Int64</option>
+                        <option value="f32">Float</option>
+                        <option value="f64">Double</option>
+                        <option value="u32">UInt32</option>
+                        <option value="u64">UInt64</option>
+                        <option value="i8">Int8</option>
+                        <option value="i16">Int16</option>
+                        <option value="u8">UInt8</option>
+                        <option value="u16">UInt16</option>
+                      </select>
+                    </div>
+                    <div class="form-group flex-1">
+                      <label class="form-label" for="manual-label">Label (optional)</label>
+                      <input
+                        id="manual-label"
+                        type="text"
+                        class="form-input"
+                        bind:value={manualLabel}
+                        placeholder="Health, Ammo, etc."
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label">&nbsp;</label>
+                      <button class="btn btn-primary" onclick={addManualWatch} title="Add address to watch list">
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Watch List -->
+            <div class="card flex-1">
+              <div class="card-header">
+                <h3>Watch List</h3>
+                <div class="header-right">
+                  {#if !attachedProcess}
+                    <span class="offline-badge">Offline</span>
+                  {/if}
+                  <span class="results-count">{watches.length} entries</span>
+                </div>
+              </div>
+              <div class="results-table-container">
+                {#if watches.length > 0}
+                  <table class="results-table">
+                    <thead>
+                      <tr>
+                        <th>Label</th>
+                        <th>Address</th>
+                        <th>Type</th>
+                        <th>Value</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each watches as watch (watch.id)}
+                        <tr class:frozen={watch.frozen} class:editing={editingWatchId === watch.id}>
+                          <td class="label-cell">{watch.label}</td>
+                          <td class="mono">{watch.address}</td>
+                          <td class="type-cell">{watch.value_type}</td>
+                          <td class="value-cell">
+                            {#if editingWatchId === watch.id}
+                              <div class="value-edit-container">
+                                <input
+                                  type="text"
+                                  class="value-edit-input"
+                                  bind:value={editingWatchValue}
+                                  placeholder="Enter value"
+                                  onkeydown={(e) => {
+                                    if (e.key === 'Enter') writeWatchValue(watch);
+                                    if (e.key === 'Escape') cancelEditingWatch();
+                                  }}
+                                />
+                                <button class="btn btn-sm btn-primary" onclick={() => writeWatchValue(watch)} disabled={!attachedProcess} title={attachedProcess ? "Write to memory" : "Attach to process first"}>
+                                  Write
+                                </button>
+                                <button class="btn btn-sm btn-secondary" onclick={cancelEditingWatch}>
+                                  Cancel
+                                </button>
+                              </div>
+                            {:else}
+                              <span class="value-display" class:no-value={!watch.value}>
+                                {watch.value ?? (attachedProcess ? "—" : "N/A")}
+                              </span>
+                            {/if}
+                          </td>
+                          <td class="actions-cell">
+                            {#if editingWatchId !== watch.id}
+                              <button
+                                class="action-btn"
+                                title="Edit value"
+                                onclick={() => startEditingWatch(watch)}
+                              >
+                                <svg viewBox="0 0 20 20" fill="currentColor">
+                                  <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                                </svg>
+                              </button>
+                              <button
+                                class="action-btn"
+                                class:active={watch.frozen}
+                                title={watch.frozen ? "Unfreeze" : "Freeze value"}
+                                onclick={() => toggleFreeze(watch)}
+                                disabled={!attachedProcess}
+                              >
+                                <svg viewBox="0 0 20 20" fill="currentColor">
+                                  {#if watch.frozen}
+                                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clip-rule="evenodd" />
+                                  {:else}
+                                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd" />
+                                  {/if}
+                                </svg>
+                              </button>
+                              <button
+                                class="action-btn delete"
+                                title="Remove from watch"
+                                onclick={() => removeWatch(watch.id)}
+                              >
+                                <svg viewBox="0 0 20 20" fill="currentColor">
+                                  <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                                </svg>
+                              </button>
+                            {/if}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {:else}
+                  <div class="empty-results">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 6.918 4.5 12 4.5c5.082 0 8.577 3.01 9.964 7.183.07.207.07.431 0 .639C20.577 16.49 17.082 19.5 12 19.5c-5.082 0-8.577-3.01-9.964-7.178z" />
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                    <p>No watch entries</p>
+                    <span>Click "+ Add Manual" above or add addresses from the Scanner tab</span>
+                  </div>
+                {/if}
+              </div>
+            </div>
+          </div>
+        {:else if activeTab === "regions"}
+          <div class="regions-panel">
+            {#if !attachedProcess}
+              <div class="requires-process">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z" />
+                </svg>
+                <h3>Process Required</h3>
+                <p>Select a process from the sidebar to view its memory regions</p>
+              </div>
+            {:else}
+              <div class="card flex-1">
+                <div class="card-header">
+                  <h3>Memory Regions</h3>
+                  <span class="results-count">{writableRegions.length} writable</span>
+                </div>
+                <div class="regions-table-container">
+                  {#if loadingRegions}
+                    <div class="loading-state">
+                      <div class="loading-spinner"></div>
+                      <span>Loading regions...</span>
+                    </div>
+                  {:else if writableRegions.length > 0}
+                    <table class="results-table">
+                      <thead>
+                        <tr>
+                          <th>Address</th>
+                          <th>Size</th>
+                          <th>Permissions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each writableRegions as region (region.start)}
+                          <tr>
+                            <td class="mono">{region.start}</td>
+                            <td>{formatSize(region.size)}</td>
+                            <td>
+                              <div class="perm-badges">
+                                {#if region.readable}<span class="perm-badge read">R</span>{/if}
+                                {#if region.writable}<span class="perm-badge write">W</span>{/if}
+                                {#if region.executable}<span class="perm-badge exec">X</span>{/if}
+                              </div>
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  {:else}
+                    <div class="empty-results">
+                      <p>No writable regions found</p>
+                    </div>
+                  {/if}
+                </div>
+              </div>
+            {/if}
+          </div>
+        {:else if activeTab === "patterns"}
+          <div class="patterns-panel">
+            <!-- Pattern Scan Section -->
+            <div class="card">
+              <div class="card-header">
+                <h3>Pattern Scan</h3>
+              </div>
+              <div class="card-body">
+                <div class="form-row">
+                  <div class="form-group flex-1">
+                    <label class="form-label" for="pattern-input">Pattern (IDA format)</label>
+                    <input
+                      id="pattern-input"
+                      type="text"
+                      class="form-input mono"
+                      bind:value={patternInput}
+                      placeholder="48 8B ?? ?? 00"
+                    />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="pattern-module">Module (optional)</label>
+                    <input
+                      id="pattern-module"
+                      type="text"
+                      class="form-input"
+                      bind:value={patternModule}
+                      placeholder="game.exe"
+                    />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">&nbsp;</label>
+                    <button class="btn btn-primary" onclick={runPatternScan} disabled={patternScanning || !attachedProcess} title={attachedProcess ? "Search memory for byte pattern" : "Attach to a process first"}>
+                      {#if patternScanning}
+                        <span class="btn-spinner-small"></span>
+                        Scanning...
+                      {:else}
+                        Scan
+                      {/if}
+                    </button>
+                  </div>
+                </div>
+                <div class="pattern-tip">
+                  Use <code>??</code> or <code>*</code> for wildcard bytes. Example: <code>48 8B ?? 00 ?? ?? 48</code>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pattern Results -->
+            {#if patternResults.length > 0}
+              <div class="card flex-1">
+                <div class="card-header">
+                  <h3>Results</h3>
+                  <span class="results-count">{patternResults.length} matches</span>
+                </div>
+                <div class="results-table-container">
+                  <table class="results-table">
+                    <thead>
+                      <tr>
+                        <th>Address</th>
+                        <th>Module</th>
+                        <th>Offset</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each patternResults as result (result.address)}
+                        <tr>
+                          <td class="mono">{result.address}</td>
+                          <td>{result.module || "-"}</td>
+                          <td class="mono">{result.module_offset || "-"}</td>
+                          <td class="actions-cell">
+                            <button
+                              class="action-btn"
+                              title="Save as signature"
+                              onclick={() => promoteToSignature(result)}
+                            >
+                              <svg viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" />
+                              </svg>
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            {/if}
+
+            <!-- Saved Signatures -->
+            <div class="card">
+              <div class="card-header">
+                <h3>Saved Signatures</h3>
+                <button class="btn btn-sm btn-secondary" onclick={() => showAddSignature = !showAddSignature} title={showAddSignature ? "Cancel adding signature" : "Manually add a new signature"}>
+                  {showAddSignature ? "Cancel" : "+ Add"}
+                </button>
+              </div>
+
+              {#if showAddSignature}
+                <div class="card-body signature-form">
+                  <div class="form-row">
+                    <div class="form-group flex-1">
+                      <label class="form-label" for="sig-label">Label</label>
+                      <input id="sig-label" type="text" class="form-input" bind:value={newSigLabel} placeholder="Health Pointer" />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="sig-type">Type</label>
+                      <select id="sig-type" class="form-select" bind:value={newSigValueType}>
+                        <option value="i32">Int32</option>
+                        <option value="i64">Int64</option>
+                        <option value="f32">Float</option>
+                        <option value="f64">Double</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="form-group flex-1">
+                      <label class="form-label" for="sig-pattern">Pattern</label>
+                      <input id="sig-pattern" type="text" class="form-input mono" bind:value={newSigPattern} placeholder="48 8B ?? 00" />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="sig-module">Module</label>
+                      <input id="sig-module" type="text" class="form-input" bind:value={newSigModule} placeholder="game.exe" />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="sig-offset">Offset</label>
+                      <input id="sig-offset" type="number" class="form-input" bind:value={newSigOffset} placeholder="0" />
+                    </div>
+                  </div>
+                  <div class="form-actions">
+                    <button class="btn btn-primary" onclick={addSignature} title="Save this pattern as a reusable signature">Save Signature</button>
+                  </div>
+                </div>
+              {/if}
+
+              <div class="results-table-container">
+                {#if signatures.length > 0}
+                  <table class="results-table">
+                    <thead>
+                      <tr>
+                        <th>Label</th>
+                        <th>Pattern</th>
+                        <th>Module</th>
+                        <th>Resolved</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each signatures as sig (sig.id)}
+                        <tr>
+                          <td>{sig.label}</td>
+                          <td class="mono pattern-preview">{sig.pattern}</td>
+                          <td>{sig.module}</td>
+                          <td class="mono">
+                            {#if sig.resolved_address}
+                              <span class="resolved">{sig.resolved_address}</span>
+                            {:else}
+                              <span class="unresolved">-</span>
+                            {/if}
+                          </td>
+                          <td class="actions-cell">
+                            {#if sig.resolved_address}
+                              <button
+                                class="action-btn"
+                                title="Add to watch list"
+                                onclick={() => watchFromSignature(sig.id)}
+                              >
+                                <svg viewBox="0 0 20 20" fill="currentColor">
+                                  <path d="M10 12a2 2 0 100-4 2 2 0 000 4z" />
+                                  <path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd" />
+                                </svg>
+                              </button>
+                            {/if}
+                            <button
+                              class="action-btn danger"
+                              title="Remove signature"
+                              onclick={() => removeSignature(sig.id)}
+                            >
+                              <svg viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                              </svg>
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {:else}
+                  <div class="empty-results">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
+                    </svg>
+                    <p>No saved signatures</p>
+                    <span>Run a pattern scan and save matches as signatures</span>
+                  </div>
+                {/if}
+              </div>
+            </div>
+          </div>
+        {/if}
+      </div>
+
+      <!-- Bottom Console Panel -->
+      {#if consoleOpen}
+        <div class="console-panel" style="height: {consoleHeight}px" class:resizing={isResizingConsole}>
+          <div class="console-resize-handle" onmousedown={startConsoleResize}></div>
+          <div class="console-header">
+            <div class="console-title">
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414zM11 12a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" />
+              </svg>
+              <span>Console</span>
+              <span class="console-shortcut">⌘`</span>
+              {#if scriptRunning}
+                <span class="console-running-badge">
+                  <div class="btn-spinner-small"></div>
+                  Running
+                </span>
+              {/if}
+            </div>
+            <div class="console-actions">
+              <button
+                class="btn btn-sm"
+                class:btn-secondary={!showScriptHelp}
+                class:btn-primary={showScriptHelp}
+                onclick={() => showScriptHelp = !showScriptHelp}
+                title="Show API reference"
+              >
+                <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px">
+                  <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                </svg>
+                API
+              </button>
+              {#if scriptRunning}
+                <button class="btn btn-secondary btn-sm" onclick={cancelScript} title="Stop script">
+                  <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clip-rule="evenodd" />
+                  </svg>
+                  Stop
+                </button>
+              {:else}
+                <button class="btn btn-primary btn-sm" onclick={runScript} title="Run script (Ctrl+Enter)">
+                  <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd" />
+                  </svg>
+                  Run
+                </button>
+              {/if}
+              <button class="btn btn-secondary btn-sm" onclick={() => scriptOutput = []} title="Clear output">
+                Clear
+              </button>
+              <button class="console-close-btn" onclick={() => consoleOpen = false} title="Close console (Esc)">
+                <svg viewBox="0 0 20 20" fill="currentColor">
+                  <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="console-body">
+            {#if showScriptHelp}
+              <div class="script-help-panel">
+                <div class="help-section">
+                  <h4>Messpit Scripting</h4>
+                  <p class="help-intro">Write JavaScript to automate memory operations. Scripts run in a sandboxed QuickJS environment.</p>
+                </div>
+
+                <div class="help-section">
+                  <h5>Memory Operations</h5>
+                  <div class="help-api">
+                    <code>mem.read(address, type)</code>
+                    <span>Read value from memory address</span>
+                  </div>
+                  <div class="help-api">
+                    <code>mem.write(address, type, value)</code>
+                    <span>Write value to memory address</span>
+                  </div>
+                  <div class="help-example">
+                    <pre>// Read health value
+const health = mem.read(0x12345678, "i32");
+ui.print("Health: " + health);
+
+// Set health to 999
+mem.write(0x12345678, "i32", 999);</pre>
+                  </div>
+                </div>
+
+                <div class="help-section">
+                  <h5>Watch & Freeze</h5>
+                  <div class="help-api">
+                    <code>watch.add(address, type, label)</code>
+                    <span>Add address to watch list</span>
+                  </div>
+                  <div class="help-api">
+                    <code>freeze.set(address, type, value, interval)</code>
+                    <span>Freeze address to value (interval in ms)</span>
+                  </div>
+                  <div class="help-api">
+                    <code>freeze.clear(address)</code>
+                    <span>Remove freeze from address</span>
+                  </div>
+                  <div class="help-example">
+                    <pre>// Add to watch list
+watch.add(0x12345678, "i32", "Player Health");
+
+// Freeze health at 999, update every 10ms
+freeze.set(0x12345678, "i32", 999, 10);</pre>
+                  </div>
+                </div>
+
+                <div class="help-section">
+                  <h5>Utilities</h5>
+                  <div class="help-api">
+                    <code>ui.print(message)</code>
+                    <span>Print to console output</span>
+                  </div>
+                  <div class="help-api">
+                    <code>ui.notify(message)</code>
+                    <span>Show notification to user</span>
+                  </div>
+                  <div class="help-api">
+                    <code>time.sleep(ms)</code>
+                    <span>Pause execution (max 10000ms)</span>
+                  </div>
+                </div>
+
+                <div class="help-section">
+                  <h5>Value Types</h5>
+                  <div class="help-types">
+                    <span><code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code></span>
+                    <span>Signed integers</span>
+                  </div>
+                  <div class="help-types">
+                    <span><code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code></span>
+                    <span>Unsigned integers</span>
+                  </div>
+                  <div class="help-types">
+                    <span><code>f32</code> <code>f64</code></span>
+                    <span>Floating point</span>
+                  </div>
+                </div>
+
+                <div class="help-section">
+                  <h5>Example: God Mode Script</h5>
+                  <div class="help-example">
+                    <pre>// Infinite health loop
+const healthAddr = 0x12345678;
+const maxHealth = 100;
+
+for (let i = 0; i &lt; 10; i++) {'{'}
+  mem.write(healthAddr, "i32", maxHealth);
+  ui.print("Health set to " + maxHealth);
+  time.sleep(1000);
+{'}'}</pre>
+                  </div>
+                </div>
+              </div>
+            {:else}
+              <div class="console-editor">
+                <div class="editor-wrapper">
+                  <pre class="syntax-highlight" aria-hidden="true">{@html highlightCode(scriptSource)}<br/></pre>
+                  <textarea
+                    class="console-textarea"
+                    bind:value={scriptSource}
+                    placeholder="// JavaScript code... (mem.read, mem.write, ui.print, etc.)"
+                    spellcheck="false"
+                  ></textarea>
+                </div>
+              </div>
+            {/if}
+            <div class="console-output">
+              <div class="console-output-header">Output</div>
+              <div class="console-output-content" bind:this={consoleOutputEl}>
+                {#if scriptOutput.length > 0}
+                  <pre>{scriptOutput.join('\n')}</pre>
+                {:else}
+                  <span class="console-placeholder">Script output will appear here...</span>
+                {/if}
+              </div>
+            </div>
+          </div>
+        </div>
+      {/if}
+  </main>
+  </div>
+</div>
+
+<style>
+  .app-container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* Top Menu Bar */
+  .top-menu-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--separator);
+    flex-shrink: 0;
+  }
+
+  .menu-bar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .app-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+    margin: 0;
+  }
+
+  .menu-bar-divider {
+    width: 1px;
+    height: 20px;
+    background: var(--separator);
+  }
+
+  .project-name-container {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .project-name-btn {
+    background: none;
+    border: none;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s;
+  }
+
+  .project-name-btn:hover {
+    background: var(--bg-primary);
+  }
+
+  .project-name-input-inline {
+    font-size: 14px;
+    font-weight: 500;
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: white;
+    outline: none;
+  }
+
+  .saved-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+  }
+
+  .unsaved-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f59e0b;
+  }
+
+  .menu-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .menu-bar-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .menu-bar-btn:hover {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+  }
+
+  .menu-bar-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  /* Main Content Area */
+  .app-content {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    width: 280px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--separator);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .search-container {
+    padding: 12px 16px;
+    position: relative;
+  }
+
+  .search-icon {
+    position: absolute;
+    left: 28px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 16px;
+    height: 16px;
+    color: var(--text-tertiary);
+  }
+
+  .search-input {
+    width: 100%;
+    padding: 10px 12px 10px 36px;
+    border: none;
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    color: var(--text-primary);
+    outline: none;
+    transition: box-shadow 0.2s;
+  }
+
+  .search-input::placeholder {
+    color: var(--text-tertiary);
+  }
+
+  .search-input:focus {
+    box-shadow: 0 0 0 3px var(--accent-light);
+  }
+
+  .process-list-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 16px;
+  }
+
+  .filter-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 16px 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .filter-checkbox input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .filter-checkbox:hover {
+    color: var(--text-primary);
+  }
+
+  .section-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .icon-button {
+    width: 28px;
+    height: 28px;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .icon-button:hover:not(:disabled) {
+    background: var(--bg-primary);
+    color: var(--accent);
+  }
+
+  .icon-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .refresh-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .refresh-icon.spinning {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .process-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px;
+  }
+
+  .process-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.15s;
+  }
+
+  .process-item:hover {
+    background: var(--bg-primary);
+  }
+
+  .process-item.selected {
+    background: var(--accent);
+  }
+
+  .process-item.selected .process-name,
+  .process-item.selected .process-pid,
+  .process-item.selected .process-icon {
+    color: white;
+  }
+
+  .process-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .process-item.selected .process-icon {
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  .process-icon svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .process-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .process-name {
+    display: block;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .process-pid {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    color: var(--text-secondary);
+    font-size: 14px;
+    gap: 12px;
+  }
+
+  .loading-spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid var(--separator);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  .sidebar-footer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--separator);
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  /* Main Content */
+  .main-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg-primary);
+  }
+
+  .error-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: #fef2f2;
+    border-bottom: 1px solid #fecaca;
+    color: var(--danger);
+    font-size: 14px;
+  }
+
+  .error-banner svg {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+
+  .error-banner span {
+    flex: 1;
+  }
+
+  .dismiss-btn {
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: transparent;
+    color: var(--danger);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+  }
+
+  .dismiss-btn:hover {
+    background: rgba(255, 59, 48, 0.1);
+  }
+
+  .dismiss-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .connected-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .connection-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: #dcfce7;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #166534;
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--success);
+    border-radius: 50%;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .connected-info {
+    flex: 1;
+  }
+
+  .connected-info h2 {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .connected-info p {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .disconnected-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .disconnected-badge {
+    padding: 4px 10px;
+    background: #f3f4f6;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .disconnected-hint {
+    font-size: 13px;
+    color: var(--text-tertiary);
+  }
+
+  .btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  .btn-sm {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: white;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background: #0066d6;
+  }
+
+  .btn-primary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .btn-secondary {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+  }
+
+  .btn-secondary:hover {
+    background: var(--bg-tertiary);
+  }
+
+  .btn-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  /* Tab Bar */
+  .tab-bar {
+    display: flex;
+    padding: 0 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .tab-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 16px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: all 0.15s;
+  }
+
+  .tab-item svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .tab-item:hover {
+    color: var(--text-primary);
+  }
+
+  .tab-item.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .badge {
+    padding: 2px 6px;
+    background: var(--bg-primary);
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .tab-item.active .badge {
+    background: var(--accent-light);
+    color: var(--accent);
+  }
+
+  /* Tab Content */
+  .tab-content {
+    flex: 1;
+    overflow: hidden;
+    padding: 20px;
+  }
+
+  .scan-panel, .watch-panel, .regions-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    height: 100%;
+  }
+
+  .card {
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card.flex-1 {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .card-header h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .results-count {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .card-body {
+    padding: 20px;
+  }
+
+  .form-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+  }
+
+  .form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .form-group.flex-1 {
+    flex: 1;
+  }
+
+  .form-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .form-input, .form-select {
+    padding: 10px 12px;
+    border: 1px solid var(--separator);
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    outline: none;
+    transition: all 0.15s;
+  }
+
+  .form-input:focus, .form-select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-light);
+  }
+
+  .form-select {
+    min-width: 110px;
+    cursor: pointer;
+  }
+
+  /* Refine section */
+  .refine-section {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .refine-modes {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .refine-btn {
+    padding: 8px 14px;
+    border: 1px solid var(--separator);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .refine-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .refine-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+
+  .mt-12 {
+    margin-top: 12px;
+  }
+
+  .flex-1 {
+    flex: 1;
+  }
+
+  /* Results Table */
+  .results-table-container, .regions-table-container {
+    flex: 1;
+    overflow: auto;
+  }
+
+  .results-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .results-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-secondary);
+    padding: 12px 20px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .results-table td {
+    padding: 12px 20px;
+    font-size: 14px;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .results-table tr:hover td {
+    background: var(--bg-primary);
+  }
+
+  .results-table tr.frozen td {
+    background: #dcfce7;
+  }
+
+  .mono {
+    font-family: "SF Mono", "Menlo", monospace;
+    font-size: 13px;
+    color: var(--accent);
+  }
+
+  .value-cell {
+    font-weight: 500;
+    color: var(--success);
+  }
+
+  .label-cell {
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .type-cell {
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-transform: uppercase;
+  }
+
+  .actions-cell {
+    width: 80px;
+    text-align: right;
+  }
+
+  .action-btn {
+    width: 28px;
+    height: 28px;
+    border: none;
+    background: transparent;
+    color: var(--text-tertiary);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    margin-left: 4px;
+  }
+
+  .action-btn:hover {
+    background: var(--accent-light);
+    color: var(--accent);
+  }
+
+  .action-btn.active {
+    background: var(--accent);
+    color: white;
+  }
+
+  .action-btn.delete:hover {
+    background: #fee2e2;
+    color: var(--danger);
+  }
+
+  .action-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .perm-badges {
+    display: flex;
+    gap: 4px;
+  }
+
+  .perm-badge {
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .perm-badge.read {
+    background: #dbeafe;
+    color: #1d4ed8;
+  }
+
+  .perm-badge.write {
+    background: #dcfce7;
+    color: #166534;
+  }
+
+  .perm-badge.exec {
+    background: #fef3c7;
+    color: #92400e;
+  }
+
+  .empty-results, .loading-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+    text-align: center;
+  }
+
+  .empty-results svg {
+    width: 48px;
+    height: 48px;
+    margin-bottom: 16px;
+    opacity: 0.3;
+  }
+
+  .empty-results p {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+  }
+
+  .empty-results span {
+    font-size: 13px;
+  }
+
+  .loading-state {
+    gap: 12px;
+  }
+
+  /* Requires Process State */
+  .requires-process {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    text-align: center;
+    color: var(--text-secondary);
+  }
+
+  .requires-process svg {
+    width: 64px;
+    height: 64px;
+    margin-bottom: 20px;
+    opacity: 0.3;
+  }
+
+  .requires-process h3 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 8px;
+  }
+
+  .requires-process p {
+    font-size: 14px;
+    color: var(--text-secondary);
+  }
+
+  .running-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--accent);
+  }
+
+  .btn-spinner-small {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--separator);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  /* Wizard Styles */
+  .wizard-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    height: 100%;
+  }
+
+  .wizard-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .wizard-title {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .wizard-title h3 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  .wizard-step-indicator {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .wizard-progress {
+    height: 4px;
+    background: var(--separator);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .wizard-progress-bar {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+  }
+
+  .wizard-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: 24px;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .wizard-step {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .wizard-step-header {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+  }
+
+  .wizard-step-number {
+    width: 36px;
+    height: 36px;
+    background: var(--accent);
+    color: white;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .wizard-step-header h4 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  .wizard-step-header p {
+    font-size: 14px;
+    color: var(--text-secondary);
+    margin: 4px 0 0;
+  }
+
+  .wizard-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .wizard-tip {
+    padding: 12px 16px;
+    background: #f0f9ff;
+    border-radius: var(--radius-md);
+    font-size: 13px;
+    color: #0369a1;
+    border-left: 3px solid var(--accent);
+  }
+
+  .wizard-instruction {
+    padding: 16px 20px;
+    background: #fef3c7;
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    color: #92400e;
+    text-align: center;
+    border-left: 3px solid #f59e0b;
+  }
+
+  .wizard-refine-options {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .refine-option {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 20px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+  }
+
+  .refine-option:hover {
+    border-color: var(--accent);
+    background: var(--accent-light);
+  }
+
+  .refine-option.exact-option {
+    cursor: default;
+    flex-wrap: wrap;
+  }
+
+  .refine-option.exact-option:hover {
+    border-color: transparent;
+    background: var(--bg-primary);
+  }
+
+  .refine-option-icon {
+    width: 40px;
+    height: 40px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .refine-option-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .refine-option-text strong {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .refine-option-text span {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .mt-8 {
+    margin-top: 8px;
+  }
+
+  .wizard-results {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .wizard-result-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--separator);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .wizard-result-item:hover {
+    border-color: var(--accent);
+    background: var(--accent-light);
+  }
+
+  .wizard-result-info {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+
+  .wizard-result-value {
+    font-weight: 600;
+    color: var(--success);
+  }
+
+  .wizard-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 8px;
+  }
+
+  .wizard-success {
+    text-align: center;
+    padding: 40px 20px;
+  }
+
+  .wizard-success-icon {
+    width: 64px;
+    height: 64px;
+    background: #dcfce7;
+    color: var(--success);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    margin: 0 auto 16px;
+  }
+
+  .wizard-success h4 {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 8px;
+  }
+
+  .wizard-success p {
+    font-size: 15px;
+    color: var(--text-secondary);
+    margin: 0;
+  }
+
+  .wizard-next-steps {
+    margin: 24px 0;
+    padding: 16px 20px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    text-align: left;
+  }
+
+  .wizard-next-steps p {
+    margin: 0 0 12px;
+    font-size: 14px;
+  }
+
+  .wizard-next-steps ul {
+    margin: 0;
+    padding-left: 20px;
+  }
+
+  .wizard-next-steps li {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+
+  .wizard-next-steps li:last-child {
+    margin-bottom: 0;
+  }
+
+  .wizard-history {
+    background: var(--bg-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: 16px 20px;
+  }
+
+  .wizard-history h5 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px;
+  }
+
+  .wizard-history-item {
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 6px 0;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .wizard-history-item:last-child {
+    border-bottom: none;
+  }
+
+  .btn-lg {
+    padding: 12px 24px;
+    font-size: 15px;
+  }
+
+  .btn-accent {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+  }
+
+  .btn-accent:hover {
+    background: linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%);
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  /* Patterns Panel Styles */
+  .patterns-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    height: 100%;
+  }
+
+  .pattern-tip {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: #f0f9ff;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .pattern-tip code {
+    background: var(--bg-secondary);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: 'SF Mono', Monaco, monospace;
+    color: var(--accent);
+  }
+
+  .pattern-preview {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+
+  .signature-form {
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .form-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 12px;
+  }
+
+  .resolved {
+    color: var(--success);
+  }
+
+  .unresolved {
+    color: var(--text-tertiary);
+  }
+
+  .action-btn.danger {
+    color: var(--danger);
+  }
+
+  .action-btn.danger:hover {
+    background: #fee2e2;
+  }
+
+  /* Manual Entry and Watch Editing */
+  .manual-entry-form {
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .offline-badge {
+    background: #fef3c7;
+    color: #92400e;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .value-edit-container {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .value-edit-input {
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: 'SF Mono', Monaco, monospace;
+    width: 120px;
+    background: white;
+  }
+
+  .value-edit-input:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--accent-light);
+  }
+
+  .value-display {
+    font-weight: 500;
+  }
+
+  .value-display.no-value {
+    color: var(--text-tertiary);
+  }
+
+  tr.editing {
+    background: var(--accent-light);
+  }
+
+  tr.editing td {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .action-btn:disabled:hover {
+    background: transparent;
+  }
+
+  /* Tab bar spacer */
+  .tab-spacer {
+    flex: 1;
+  }
+
+  .console-toggle {
+    margin-left: auto;
+  }
+
+  /* Bottom Console Panel */
+  .console-panel {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--separator);
+    flex-shrink: 0;
+    min-height: 150px;
+    max-height: 50vh;
+  }
+
+  .console-resize-handle {
+    height: 4px;
+    background: var(--separator);
+    cursor: ns-resize;
+    transition: background 0.15s;
+  }
+
+  .console-resize-handle:hover {
+    background: var(--accent);
+  }
+
+  .console-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--separator);
+    background: var(--bg-primary);
+  }
+
+  .console-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .console-title svg {
+    width: 16px;
+    height: 16px;
+    color: var(--accent);
+  }
+
+  .console-running-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--accent-light);
+    color: var(--accent);
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .console-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .console-close-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .console-close-btn:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .console-close-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .console-body {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .console-editor {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--separator);
+  }
+
+  .console-textarea {
+    flex: 1;
+    width: 100%;
+    padding: 12px;
+    border: none;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+  }
+
+  .console-textarea::placeholder {
+    color: var(--text-tertiary);
+  }
+
+  .console-output {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #1e1e1e;
+    min-width: 300px;
+  }
+
+  .console-output-header {
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    border-bottom: 1px solid #333;
+  }
+
+  .console-output-content {
+    flex: 1;
+    padding: 12px;
+    overflow-y: auto;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .console-output-content pre {
+    margin: 0;
+    color: #d4d4d4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+
+  .console-placeholder {
+    color: #666;
+    font-style: italic;
+  }
+
+  /* Console resizing state */
+  .console-panel.resizing {
+    user-select: none;
+  }
+
+  .console-panel.resizing .console-resize-handle {
+    background: var(--accent);
+  }
+
+  .console-shortcut {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    background: var(--bg-secondary);
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    font-family: system-ui;
+  }
+
+  /* Syntax highlighting editor */
+  .editor-wrapper {
+    position: relative;
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+
+  .syntax-highlight {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+    padding: 12px;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: var(--text-primary);
+    pointer-events: none;
+    overflow: auto;
+    background: var(--bg-secondary);
+  }
+
+  .editor-wrapper .console-textarea {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: transparent;
+    color: transparent;
+    caret-color: var(--text-primary);
+    z-index: 1;
+  }
+
+  /* Syntax highlighting colors */
+  .syntax-highlight :global(.hl-keyword) {
+    color: #c678dd;
+  }
+
+  .syntax-highlight :global(.hl-string) {
+    color: #98c379;
+  }
+
+  .syntax-highlight :global(.hl-comment) {
+    color: #5c6370;
+    font-style: italic;
+  }
+
+  .syntax-highlight :global(.hl-number) {
+    color: #d19a66;
+  }
+
+  .syntax-highlight :global(.hl-function) {
+    color: #61afef;
+  }
+
+  /* Script Help Panel */
+  .script-help-panel {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--separator);
+  }
+
+  .help-section {
+    margin-bottom: 20px;
+  }
+
+  .help-section:last-child {
+    margin-bottom: 0;
+  }
+
+  .help-section h4 {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 8px;
+  }
+
+  .help-section h5 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    margin: 0 0 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .help-intro {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .help-api {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 8px;
+    padding: 8px 10px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-sm);
+  }
+
+  .help-api code {
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  .help-api span {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .help-example {
+    margin-top: 8px;
+  }
+
+  .help-example pre {
+    margin: 0;
+    padding: 10px 12px;
+    background: #1e1e1e;
+    border-radius: var(--radius-sm);
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #d4d4d4;
+    overflow-x: auto;
+  }
+
+  .help-types {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 10px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+  }
+
+  .help-types code {
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 11px;
+    background: var(--bg-secondary);
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: var(--accent);
+    margin-right: 4px;
+  }
+
+  .help-types > span:last-child {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+</style>

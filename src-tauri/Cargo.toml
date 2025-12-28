@@ -1,0 +1,34 @@
+[package]
+name = "messpit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Messpit - Modern memory trainer studio"
+default-run = "messpit"
+
+[[bin]]
+name = "messpit"
+path = "src/main.rs"
+
+[dependencies]
+messpit-protocol = { path = "../crates/protocol" }
+messpit-platform = { path = "../crates/platform" }
+messpit-engine = { path = "../crates/engine-core" }
+messpit-policy = { path = "../crates/policy" }
+messpit-script-host = { path = "../crates/script-host" }
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]

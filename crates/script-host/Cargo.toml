@@ -1,0 +1,17 @@
+[package]
+name = "messpit-script-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QuickJS sandbox for user scripts"
+
+[dependencies]
+messpit-protocol = { path = "../protocol" }
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rquickjs.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]

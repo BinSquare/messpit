@@ -1,0 +1,30 @@
+# Rust
+/target/
+Cargo.lock
+
+# Tauri
+/src-tauri/target/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Messpit
+*.messpit-cache/
+*.log
+
+# Environment
+.env
+.env.local
