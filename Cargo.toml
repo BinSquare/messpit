@@ -27,6 +27,7 @@ rayon = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 # QuickJS for scripting
 rquickjs = { version = "0.9", features = ["bindgen", "parallel", "futures"] }
