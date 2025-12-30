@@ -1,126 +1,48 @@
 //! Messpit - Modern Memory Trainer Studio
 //!
 //! Tauri application with Svelte frontend.
+//!
+//! ## Module Structure
+//! - `helpers` - Constants, error formatting, and value parsing utilities
+//! - `state` - Application state and lock extension traits
+//! - `types` - Request/response types for frontend communication
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod helpers;
+mod state;
+mod types;
+
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex};
 
-/// Maximum size for a single memory region read (256 MB)
-const MAX_REGION_READ_SIZE: usize = 256 * 1024 * 1024;
+// Re-export from helpers module
+use helpers::{
+    error_limit, error_process, error_requires, error_validation,
+    parse_address, parse_value, parse_value_type, format_value_type,
+    MAX_CONCURRENT_SCRIPTS, MAX_LABEL_LENGTH, MAX_NOTES_LENGTH, MAX_PATTERN_INPUT_LENGTH,
+    MAX_PROJECT_NAME_LENGTH, MAX_REGION_READ_SIZE, MAX_SCAN_RESULTS, MAX_SCRIPT_LENGTH,
+    MAX_SCRIPT_OUTPUT_ENTRIES, MAX_WATCH_ENTRIES, MIN_VALID_ADDRESS,
+};
 
-/// Minimum valid user-space address (skip null page and low addresses)
-const MIN_VALID_ADDRESS: u64 = 0x10000;
+// Re-export lock traits from state module
+use state::{MutexExt, RwLockExt};
 
-/// Maximum length for label strings
-const MAX_LABEL_LENGTH: usize = 256;
-
-/// Maximum length for pattern strings
-const MAX_PATTERN_INPUT_LENGTH: usize = 1024;
-
-/// Maximum length for script source
-const MAX_SCRIPT_LENGTH: usize = 256 * 1024; // 256 KB
-
-/// Maximum length for project name
-const MAX_PROJECT_NAME_LENGTH: usize = 128;
-
-/// Maximum length for notes
-const MAX_NOTES_LENGTH: usize = 64 * 1024; // 64 KB
-
-/// Maximum number of watch entries
-const MAX_WATCH_ENTRIES: usize = 1000;
-
-/// Maximum number of concurrent scripts
-const MAX_CONCURRENT_SCRIPTS: usize = 10;
-
-/// Maximum number of script output entries to keep
-const MAX_SCRIPT_OUTPUT_ENTRIES: usize = 50;
-
-/// Maximum scan results to store
-const MAX_SCAN_RESULTS: usize = 100_000;
-
-// ============================================================================
-// User-Friendly Error Messages
-// ============================================================================
-
-/// Format a user-friendly error for process operations
-fn error_process(action: &str, details: &str) -> String {
-    format!("Failed to {}: {}", action, details)
-}
-
-/// Format a user-friendly error for validation failures
-fn error_validation(field: &str, issue: &str) -> String {
-    format!("Invalid {}: {}", field, issue)
-}
-
-/// Format a user-friendly error for limit exceeded
-fn error_limit(resource: &str, max: usize) -> String {
-    format!("{} limit reached (maximum: {})", resource, max)
-}
-
-/// Format a user-friendly error for missing requirements
-fn error_requires(requirement: &str) -> String {
-    format!("This operation requires {}", requirement)
-}
-
-/// Helper trait for handling mutex lock errors gracefully
-trait MutexExt<T> {
-    /// Lock the mutex, recovering from poison errors by taking the data
-    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
-
-    /// Lock the mutex, returning an error string if poisoned
-    fn lock_checked(&self) -> Result<MutexGuard<'_, T>, String>;
-}
-
-impl<T> MutexExt<T> for Mutex<T> {
-    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("Recovered from poisoned mutex");
-            poisoned.into_inner()
-        })
-    }
-
-    fn lock_checked(&self) -> Result<MutexGuard<'_, T>, String> {
-        self.lock().map_err(|_| "Internal error: mutex was poisoned".to_string())
-    }
-}
-
-/// Helper trait for handling RwLock errors gracefully
-trait RwLockExt<T> {
-    /// Write lock, recovering from poison errors
-    fn write_or_recover(&self) -> RwLockWriteGuard<'_, T>;
-
-    /// Read lock with error propagation
-    fn read_checked(&self) -> Result<RwLockReadGuard<'_, T>, String>;
-
-    /// Write lock with error propagation
-    fn write_checked(&self) -> Result<RwLockWriteGuard<'_, T>, String>;
-}
-
-impl<T> RwLockExt<T> for RwLock<T> {
-    fn write_or_recover(&self) -> RwLockWriteGuard<'_, T> {
-        self.write().unwrap_or_else(|poisoned| {
-            tracing::warn!("Recovered from poisoned RwLock (write)");
-            poisoned.into_inner()
-        })
-    }
-
-    fn read_checked(&self) -> Result<RwLockReadGuard<'_, T>, String> {
-        self.read().map_err(|_| "Internal error: RwLock was poisoned".to_string())
-    }
-
-    fn write_checked(&self) -> Result<RwLockWriteGuard<'_, T>, String> {
-        self.write().map_err(|_| "Internal error: RwLock was poisoned".to_string())
-    }
-}
+// Re-export types from types module
+use types::{
+    AddSignatureRequest, AddWatchRequest, CheatTableEntryInfo, CheatTableInfo,
+    ExportCheatTableRequest, FreezeRequest, ImportCheatTableRequest, PatternScanRequest,
+    PatternScanResult, PointerScanRequest, PointerScanResultItem, ProcessInfo,
+    AttachResult, RefineRequest, RegionInfo, ResolveChainRequest, ScanRequest,
+    ScanResult, ScriptInfo, ScriptOutputResult, ScriptRunResult, SignatureInfo,
+    WatchInfo, WriteValueRequest, ReadValueRequest, ProjectInfo, AuditEntryInfo,
+};
 
 use messpit_engine::session::{FreezeEntry, WatchEntry};
 use messpit_engine::{decode_at, encode_value, new_shared_session, AuditLog, Pattern, PatternScanner, Project, ProjectSignature, ProjectWatchEntry, ScanEngine, SharedSession};
 use messpit_platform::{attach, list_processes, PlatformError, ProcessHandle};
 use messpit_protocol::{Address, Architecture, EntryId, Pid, Refinement, RunId, ScanComparison, ScanParams, Value, ValueType};
 use messpit_script_host::{CancellationToken, HostRequest, HostResponse, ScriptConfig, ScriptHost, TYPESCRIPT_DEFINITIONS};
-use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
 
@@ -167,80 +89,7 @@ struct AttachedProcess {
     handle: Box<dyn ProcessHandle>,
 }
 
-/// Process info returned to frontend
-#[derive(Serialize)]
-struct ProcessInfo {
-    pid: u32,
-    name: String,
-    path: Option<String>,
-    attachable: bool,
-}
-
-/// Attach result returned to frontend
-#[derive(Serialize)]
-struct AttachResult {
-    pid: u32,
-    name: String,
-    arch: String,
-}
-
-/// Region info returned to frontend
-#[derive(Serialize)]
-struct RegionInfo {
-    start: String,
-    size: u64,
-    readable: bool,
-    writable: bool,
-    executable: bool,
-}
-
-/// Scan result returned to frontend
-#[derive(Serialize)]
-struct ScanResult {
-    address: String,
-    value: String,
-}
-
-/// Scan parameters from frontend
-#[derive(Deserialize)]
-struct ScanRequest {
-    value_type: String,
-    comparison: String,
-    value: String,
-}
-
-/// Refinement parameters from frontend
-#[derive(Deserialize)]
-struct RefineRequest {
-    mode: String,
-    value: Option<String>,
-}
-
-/// Watch entry returned to frontend
-#[derive(Serialize)]
-struct WatchInfo {
-    id: String,
-    address: String,
-    value_type: String,
-    label: String,
-    value: Option<String>,
-    frozen: bool,
-}
-
-/// Add watch request from frontend
-#[derive(Deserialize)]
-struct AddWatchRequest {
-    address: String,
-    value_type: String,
-    label: String,
-}
-
-/// Freeze request from frontend
-#[derive(Deserialize)]
-struct FreezeRequest {
-    entry_id: String,
-    value: String,
-}
+// Types are imported from the types module
 
 /// List all running processes
 #[tauri::command]
@@ -343,12 +192,27 @@ fn get_regions(state: State<'_, AppState>) -> Result<Vec<RegionInfo>, String> {
 
     Ok(regions
         .into_iter()
-        .map(|r| RegionInfo {
-            start: format!("0x{:016X}", r.base.0),
-            size: r.size,
-            readable: r.permissions.read,
-            writable: r.permissions.write,
-            executable: r.permissions.execute,
+        .map(|r| {
+            // Try to read first 16 bytes for preview if readable
+            let preview = if r.permissions.read {
+                let mut buf = [0u8; 16];
+                attached.handle.read_memory(r.base, &mut buf).ok().map(|_| {
+                    buf.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+                })
+            } else {
+                None
+            };
+
+            RegionInfo {
+                start: format!("0x{:016X}", r.base.0),
+                end: format!("0x{:016X}", r.base.0.saturating_add(r.size)),
+                size: r.size,
+                readable: r.permissions.read,
+                writable: r.permissions.write,
+                executable: r.permissions.execute,
+                module: r.module,
+                preview,
+            }
         })
         .collect())
 }
@@ -574,13 +438,16 @@ fn get_watches(state: State<'_, AppState>) -> Result<Vec<WatchInfo>, String> {
             None
         };
 
+        let frozen = session.freezes.contains_key(&w.id);
+        let freeze_value = session.freezes.get(&w.id).map(|f| format_val(&f.value));
         WatchInfo {
             id: w.id.0.to_string(),
             address: format!("0x{:016X}", w.address.0),
             value_type: format_value_type(&w.value_type),
             label: w.label.clone(),
             value: current_value.map(|v| format_val(&v)),
-            frozen: session.freezes.contains_key(&w.id),
+            frozen,
+            freeze_value,
         }
     }).collect();
 
@@ -628,13 +495,6 @@ fn toggle_freeze(request: FreezeRequest, state: State<'_, AppState>) -> Result<b
 }
 
 /// Write a value directly to memory
-#[derive(Deserialize)]
-struct WriteValueRequest {
-    address: String,
-    value_type: String,
-    value: String,
-}
-
 #[tauri::command]
 fn write_value(request: WriteValueRequest, state: State<'_, AppState>) -> Result<(), String> {
     let guard = state.attached.lock_checked()?;
@@ -662,12 +522,6 @@ fn write_value(request: WriteValueRequest, state: State<'_, AppState>) -> Result
 }
 
 /// Read a value directly from memory
-#[derive(Deserialize)]
-struct ReadValueRequest {
-    address: String,
-    value_type: String,
-}
-
 #[tauri::command]
 fn read_value(request: ReadValueRequest, state: State<'_, AppState>) -> Result<Option<String>, String> {
     let guard = state.attached.lock_checked()?;
@@ -678,103 +532,38 @@ fn read_value(request: ReadValueRequest, state: State<'_, AppState>) -> Result<O
     let size = value_type.size().unwrap_or(8);
 
     let mut buf = vec![0u8; size];
-    if attached.handle.read_memory(address, &mut buf).is_ok()
-        && let Some(value) = decode_at(&buf, &value_type) {
+    if attached.handle.read_memory(address, &mut buf).is_ok() {
+        if let Some(value) = decode_at(&buf, &value_type) {
             return Ok(Some(format_val(&value)));
         }
+    }
 
     Ok(None)
 }
 
-fn parse_value_type(s: &str) -> Result<ValueType, String> {
-    match s {
-        "i32" => Ok(ValueType::I32),
-        "i64" => Ok(ValueType::I64),
-        "f32" => Ok(ValueType::F32),
-        "f64" => Ok(ValueType::F64),
-        "u32" => Ok(ValueType::U32),
-        "u64" => Ok(ValueType::U64),
-        "i8" => Ok(ValueType::I8),
-        "i16" => Ok(ValueType::I16),
-        "u8" => Ok(ValueType::U8),
-        "u16" => Ok(ValueType::U16),
-        _ => Err(error_validation("value type", &format!(
-            "'{}' is not supported. Use: i8, i16, i32, i64, u8, u16, u32, u64, f32, or f64", s
-        ))),
-    }
+/// Read raw memory bytes for hex viewer
+#[tauri::command]
+fn read_memory_bytes(
+    address: String,
+    size: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<u8>, String> {
+    let guard = state.attached.lock_checked()?;
+    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+
+    let address = parse_address(&address)?;
+
+    // Limit read size to prevent excessive memory usage (max 64KB per read)
+    let size = size.min(65536);
+
+    let mut buf = vec![0u8; size];
+    attached.handle.read_memory(address, &mut buf)
+        .map_err(|e| format!("Failed to read memory: {}", e))?;
+
+    Ok(buf)
 }
 
-fn format_value_type(vt: &ValueType) -> String {
-    match vt {
-        ValueType::I8 => "i8",
-        ValueType::I16 => "i16",
-        ValueType::I32 => "i32",
-        ValueType::I64 => "i64",
-        ValueType::U8 => "u8",
-        ValueType::U16 => "u16",
-        ValueType::U32 => "u32",
-        ValueType::U64 => "u64",
-        ValueType::F32 => "f32",
-        ValueType::F64 => "f64",
-        _ => "unknown",
-    }.to_string()
-}
-
-fn parse_address(s: &str) -> Result<Address, String> {
-    let s = s.trim_start_matches("0x").trim_start_matches("0X");
-
-    if s.is_empty() {
-        return Err(error_validation("address", "cannot be empty"));
-    }
-
-    let addr = u64::from_str_radix(s, 16)
-        .map_err(|_| error_validation("address", "must be a valid hexadecimal number (e.g., 0x12345678)"))?;
-
-    // Validate address range - reject addresses in null page / low memory
-    if addr < MIN_VALID_ADDRESS {
-        return Err(error_validation("address", &format!(
-            "0x{:X} is in protected memory. Use addresses above 0x{:X}",
-            addr, MIN_VALID_ADDRESS
-        )));
-    }
-
-    Ok(Address(addr))
-}
-
-fn parse_value(s: &str, value_type: &ValueType) -> Result<Value, String> {
-    if s.is_empty() {
-        return Err(error_validation("value", "cannot be empty"));
-    }
-
-    match value_type {
-        ValueType::I32 => s
-            .parse::<i32>()
-            .map(Value::I32)
-            .map_err(|_| error_validation("value", "must be a valid 32-bit signed integer (e.g., 100, -50)")),
-        ValueType::I64 => s
-            .parse::<i64>()
-            .map(Value::I64)
-            .map_err(|_| error_validation("value", "must be a valid 64-bit signed integer")),
-        ValueType::U32 => s
-            .parse::<u32>()
-            .map(Value::U32)
-            .map_err(|_| error_validation("value", "must be a valid 32-bit unsigned integer (0 to 4294967295)")),
-        ValueType::U64 => s
-            .parse::<u64>()
-            .map(Value::U64)
-            .map_err(|_| error_validation("value", "must be a valid 64-bit unsigned integer")),
-        ValueType::F32 => s
-            .parse::<f32>()
-            .map(Value::F32)
-            .map_err(|_| error_validation("value", "must be a valid decimal number (e.g., 3.14)")),
-        ValueType::F64 => s
-            .parse::<f64>()
-            .map(Value::F64)
-            .map_err(|_| error_validation("value", "must be a valid decimal number")),
-        _ => Err(error_validation("value type", "only integer and float types are supported for parsing")),
-    }
-}
-
+/// Format a value for compact display (4 decimal places for floats)
 fn format_val(val: &Value) -> String {
     match val {
         Value::I8(v) => format!("{v}"),
@@ -795,15 +584,6 @@ fn format_val(val: &Value) -> String {
 // ============================================================================
 // Project Management Commands
 // ============================================================================
-
-/// Project info returned to frontend
-#[derive(Serialize)]
-struct ProjectInfo {
-    name: String,
-    path: Option<String>,
-    watch_count: usize,
-    has_unsaved_changes: bool,
-}
 
 /// Get current project info
 #[tauri::command]
@@ -833,16 +613,6 @@ fn record_audit(state: &AppState, operation: &str, pid: Option<u32>, address: Op
     if let Ok(mut log) = state.audit_log.lock() {
         log.record(operation, pid, address, details);
     }
-}
-
-/// Audit log entry for frontend
-#[derive(Serialize)]
-struct AuditEntryInfo {
-    timestamp: String,
-    operation: String,
-    pid: Option<u32>,
-    address: Option<String>,
-    details: Option<String>,
 }
 
 /// Get all audit log entries
@@ -957,7 +727,14 @@ fn load_project(file_path: String, state: State<'_, AppState>) -> Result<Project
 
     // Import watches from project
     for entry in &loaded.watch_entries {
-        let id = entry.id.parse().unwrap_or_else(|_| uuid::Uuid::new_v4());
+        let id = entry.id.parse().unwrap_or_else(|e| {
+            tracing::warn!(
+                entry_id = %entry.id,
+                error = %e,
+                "Invalid UUID in project file, generating new ID"
+            );
+            uuid::Uuid::new_v4()
+        });
         let watch = WatchEntry {
             id: EntryId(id),
             address: Address(entry.address),
@@ -968,8 +745,8 @@ fn load_project(file_path: String, state: State<'_, AppState>) -> Result<Project
         session.add_watch(watch);
 
         // Restore freeze if applicable
-        if entry.frozen
-            && let Some(ref freeze_val) = entry.freeze_value {
+        if entry.frozen {
+            if let Some(ref freeze_val) = entry.freeze_value {
                 let freeze = FreezeEntry::new(
                     EntryId(id),
                     Address(entry.address),
@@ -979,6 +756,7 @@ fn load_project(file_path: String, state: State<'_, AppState>) -> Result<Project
                 );
                 session.set_freeze(EntryId(id), freeze);
             }
+        }
     }
 
     let watch_count = loaded.watch_entries.len();
@@ -1087,20 +865,6 @@ fn set_project_notes(notes: String, state: State<'_, AppState>) -> Result<(), St
 // ============================================================================
 // Script Commands
 // ============================================================================
-
-/// Script run result
-#[derive(Serialize)]
-struct ScriptRunResult {
-    run_id: String,
-}
-
-/// Script output returned to frontend
-#[derive(Serialize)]
-struct ScriptOutputResult {
-    lines: Vec<String>,
-    finished: bool,
-    error: Option<String>,
-}
 
 /// Run a script
 #[tauri::command]
@@ -1379,15 +1143,6 @@ fn get_script_api_types() -> String {
 // Script Management Commands
 // ============================================================================
 
-/// Script info for frontend
-#[derive(Serialize, Clone)]
-struct ScriptInfo {
-    id: String,
-    name: String,
-    source: String,
-    enabled: bool,
-}
-
 /// Save a script to the project
 #[tauri::command]
 fn save_script(id: String, name: String, source: String, state: State<'_, AppState>) -> Result<(), String> {
@@ -1484,37 +1239,6 @@ fn set_script_enabled(id: String, enabled: bool, state: State<'_, AppState>) -> 
 // Pattern Scanning Commands
 // ============================================================================
 
-/// Pattern scan request from frontend
-#[derive(Deserialize)]
-struct PatternScanRequest {
-    /// IDA-style pattern (e.g., "48 8B ?? 00")
-    pattern: String,
-    /// Optional module name to scope the search
-    module: Option<String>,
-    /// Whether to use SIMD acceleration
-    use_simd: bool,
-}
-
-/// Pattern scan result for frontend
-#[derive(Serialize)]
-struct PatternScanResult {
-    address: String,
-    module: Option<String>,
-    module_offset: Option<String>,
-}
-
-/// Signature info for frontend
-#[derive(Serialize)]
-struct SignatureInfo {
-    id: String,
-    label: String,
-    pattern: String,
-    module: String,
-    offset: i64,
-    value_type: String,
-    resolved_address: Option<String>,
-}
-
 /// Perform a pattern scan
 #[tauri::command]
 fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Result<Vec<PatternScanResult>, String> {
@@ -1524,10 +1248,11 @@ fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Resu
     }
 
     // Validate module name if provided
-    if let Some(ref module) = request.module
-        && module.len() > MAX_LABEL_LENGTH {
+    if let Some(ref module) = request.module {
+        if module.len() > MAX_LABEL_LENGTH {
             return Err(format!("Module name too long (max {} characters)", MAX_LABEL_LENGTH));
         }
+    }
 
     let guard = state.attached.lock_checked()?;
     let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
@@ -1579,16 +1304,372 @@ fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Resu
     Ok(result_list)
 }
 
-/// Add a signature to the project
-#[derive(Deserialize)]
-struct AddSignatureRequest {
-    label: String,
-    pattern: String,
-    module: String,
-    offset: i64,
-    value_type: String,
+// ============================================================================
+// Pointer Scanning Commands
+// ============================================================================
+
+/// Perform a pointer scan to find pointer chains to a target address
+#[tauri::command]
+fn pointer_scan(request: PointerScanRequest, state: State<'_, AppState>) -> Result<Vec<PointerScanResultItem>, String> {
+    use messpit_engine::pointer::{PointerScanner, PointerScanConfig};
+
+    // Parse target address
+    let target_str = request.target_address.trim_start_matches("0x").trim_start_matches("0X");
+    let target = u64::from_str_radix(target_str, 16)
+        .map_err(|_| error_validation("target address", "must be a valid hexadecimal address"))?;
+
+    if target < MIN_VALID_ADDRESS {
+        return Err(error_validation("target address", "address is too low to be valid user-space memory"));
+    }
+
+    let guard = state.attached.lock_checked()?;
+    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+
+    // Determine pointer size based on architecture
+    let pointer_size = match attached.handle.architecture() {
+        Architecture::X86 => 4,
+        _ => 8,
+    };
+
+    // Build config with validated parameters
+    let config = PointerScanConfig {
+        max_depth: request.max_depth.unwrap_or(5).clamp(1, 7),
+        max_offset: request.max_offset.unwrap_or(0x1000).min(0x10000),
+        max_results: request.max_results.unwrap_or(100).min(1000),
+        aligned_only: true,
+        pointer_size,
+        static_base_only: true,
+    };
+
+    // Get regions and modules
+    let regions = attached.handle.regions().map_err(|e| error_process("get memory regions", &e.to_string()))?;
+    let modules = attached.handle.modules().unwrap_or_default();
+
+    // Perform the scan
+    let scanner = PointerScanner::new(config);
+    let result = scanner.scan(
+        attached.handle.as_ref(),
+        Address(target),
+        &regions,
+        &modules,
+    );
+
+    if result.cancelled {
+        return Err("Pointer scan was cancelled".to_string());
+    }
+
+    // Convert to frontend format
+    let items: Vec<PointerScanResultItem> = result.chains
+        .into_iter()
+        .map(|chain| PointerScanResultItem {
+            chain: chain.format(),
+            module: chain.module.clone(),
+            module_offset: format!("0x{:X}", chain.module_offset),
+            offsets: chain.offsets.iter().map(|o| {
+                if *o >= 0 {
+                    format!("0x{:X}", o)
+                } else {
+                    format!("-0x{:X}", o.unsigned_abs())
+                }
+            }).collect(),
+        })
+        .collect();
+
+    tracing::info!(
+        target = target,
+        results = items.len(),
+        pointers_scanned = result.pointers_scanned,
+        "Pointer scan completed"
+    );
+
+    Ok(items)
 }
 
+/// Resolve a pointer chain to get the current address
+#[tauri::command]
+fn resolve_pointer_chain(request: ResolveChainRequest, state: State<'_, AppState>) -> Result<String, String> {
+    use messpit_engine::pointer::{resolve_chain, PointerChain};
+
+    let guard = state.attached.lock_checked()?;
+    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+
+    // Parse module offset
+    let module_offset_str = request.module_offset.trim_start_matches("0x").trim_start_matches("0X");
+    let module_offset = u64::from_str_radix(module_offset_str, 16)
+        .map_err(|_| error_validation("module offset", "must be a valid hexadecimal value"))?;
+
+    // Parse offsets
+    let offsets: Result<Vec<i64>, String> = request.offsets.iter().map(|o| {
+        let s = o.trim();
+        let (negative, num_str) = if s.starts_with('-') {
+            (true, s.trim_start_matches('-').trim_start_matches("0x").trim_start_matches("0X"))
+        } else {
+            (false, s.trim_start_matches('+').trim_start_matches("0x").trim_start_matches("0X"))
+        };
+        let val = i64::from_str_radix(num_str, 16)
+            .map_err(|_| error_validation("offset", &format!("'{}' is not a valid hexadecimal value", o)))?;
+        Ok(if negative { -val } else { val })
+    }).collect();
+    let offsets = offsets?;
+
+    let chain = PointerChain {
+        module: request.module,
+        module_offset,
+        offsets,
+        resolved: Address(0), // Will be calculated
+    };
+
+    // Determine pointer size
+    let pointer_size = match attached.handle.architecture() {
+        Architecture::X86 => 4,
+        _ => 8,
+    };
+
+    let modules = attached.handle.modules().unwrap_or_default();
+    let resolved = resolve_chain(attached.handle.as_ref(), &chain, &modules, pointer_size)
+        .ok_or_else(|| "Failed to resolve pointer chain - one or more pointers are invalid".to_string())?;
+
+    Ok(format!("0x{:016X}", resolved.0))
+}
+
+// ============================================================================
+// Cheat Table Export/Import Commands
+// ============================================================================
+
+use messpit_engine::cheattable::{CheatTable, CheatEntry, AddressLocator};
+
+/// Export current watches to a cheat table
+#[tauri::command]
+fn export_cheat_table(request: ExportCheatTableRequest, state: State<'_, AppState>) -> Result<String, String> {
+    // Validate name
+    if request.name.is_empty() || request.name.len() > MAX_LABEL_LENGTH {
+        return Err(error_validation("name", "must be 1-256 characters"));
+    }
+
+    let session = state.session.read_checked()?;
+    let attached = state.attached.lock_checked()?;
+
+    // Get process name
+    let process_name = attached.as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut table = CheatTable::new(&request.name, &process_name);
+    table.author = request.author;
+    table.description = request.description;
+
+    // Get module hash if attached
+    if let Some(ref proc) = *attached {
+        table.target.module_hash = proc.handle.fingerprint().module_hash;
+    }
+
+    // Collect entries to export
+    let entry_filter: Option<std::collections::HashSet<String>> = request.entry_ids
+        .map(|ids| ids.into_iter().collect());
+
+    for watch in session.watches() {
+        // Filter if specific entries requested
+        if let Some(ref filter) = entry_filter {
+            if !filter.contains(&watch.id.0.to_string()) {
+                continue;
+            }
+        }
+
+        let frozen = session.freezes.contains_key(&watch.id);
+        let freeze_value = session.freezes.get(&watch.id).map(|f| f.value.clone());
+
+        let entry = CheatEntry {
+            id: watch.id.0.to_string(),
+            label: watch.label.clone(),
+            group: None,
+            value_type: watch.value_type,
+            locator: AddressLocator::Direct { address: watch.address.0 },
+            frozen,
+            freeze_value,
+            hotkey: None,
+            description: None,
+        };
+
+        table.add_entry(entry);
+    }
+
+    // Convert to JSON
+    table.to_json().map_err(|e| format!("Failed to export: {}", e))
+}
+
+/// Parse a cheat table JSON and return info
+#[tauri::command]
+fn parse_cheat_table(json: String) -> Result<CheatTableInfo, String> {
+    let table = CheatTable::from_json(&json)
+        .map_err(|e| format!("Invalid cheat table: {}", e))?;
+
+    let entries: Vec<CheatTableEntryInfo> = table.entries.iter().map(|e| {
+        let locator_kind = match &e.locator {
+            AddressLocator::Direct { .. } => "direct",
+            AddressLocator::PointerChain { .. } => "pointer_chain",
+            AddressLocator::Signature { .. } => "signature",
+        };
+
+        CheatTableEntryInfo {
+            id: e.id.clone(),
+            label: e.label.clone(),
+            group: e.group.clone(),
+            value_type: format_value_type(&e.value_type),
+            locator: e.locator.format(),
+            locator_kind: locator_kind.to_string(),
+            frozen: e.frozen,
+            description: e.description.clone(),
+        }
+    }).collect();
+
+    Ok(CheatTableInfo {
+        name: table.name,
+        author: table.author,
+        description: table.description,
+        process_name: table.target.process_name,
+        entry_count: entries.len(),
+        created: table.created,
+        modified: table.modified,
+        entries,
+    })
+}
+
+/// Import entries from a cheat table
+#[tauri::command]
+fn import_cheat_table(request: ImportCheatTableRequest, state: State<'_, AppState>) -> Result<usize, String> {
+    use messpit_engine::pointer::{resolve_chain, PointerChain};
+
+    let table = CheatTable::from_json(&request.json)
+        .map_err(|e| format!("Invalid cheat table: {}", e))?;
+
+    let mut session = state.session.write_checked()?;
+    let attached = state.attached.lock_checked()?;
+
+    // Check if attached process matches (warn but continue)
+    if let Some(ref proc) = *attached {
+        if !proc.name.to_lowercase().contains(&table.target.process_name.to_lowercase()) {
+            tracing::warn!(
+                "Importing cheat table for '{}' but attached to '{}'",
+                table.target.process_name,
+                proc.name
+            );
+        }
+    }
+
+    let entry_filter: Option<std::collections::HashSet<String>> = request.entry_ids
+        .map(|ids| ids.into_iter().collect());
+
+    let mut imported = 0;
+
+    for entry in &table.entries {
+        // Filter if specific entries requested
+        if let Some(ref filter) = entry_filter {
+            if !filter.contains(&entry.id) {
+                continue;
+            }
+        }
+
+        // Resolve address based on locator type
+        let address = if request.resolve && attached.is_some() {
+            let proc = attached.as_ref().unwrap();
+            match &entry.locator {
+                AddressLocator::Direct { address } => Some(Address(*address)),
+                AddressLocator::PointerChain { module, module_offset, offsets } => {
+                    let chain = PointerChain {
+                        module: Some(module.clone()),
+                        module_offset: *module_offset,
+                        offsets: offsets.clone(),
+                        resolved: Address(0),
+                    };
+                    let pointer_size = match proc.handle.architecture() {
+                        Architecture::X86 => 4,
+                        _ => 8,
+                    };
+                    let modules = proc.handle.modules().unwrap_or_default();
+                    resolve_chain(proc.handle.as_ref(), &chain, &modules, pointer_size)
+                }
+                AddressLocator::Signature { module, pattern, offset } => {
+                    // Try to resolve via pattern scan
+                    if let Ok(parsed) = Pattern::parse(pattern) {
+                        let regions = proc.handle.regions().unwrap_or_default();
+                        let modules = proc.handle.modules().unwrap_or_default();
+                        let module_lower = module.to_lowercase();
+                        let scan_regions: Vec<_> = regions.into_iter()
+                            .filter(|r| r.module.as_ref().is_some_and(|m| m.to_lowercase().contains(&module_lower)))
+                            .collect();
+
+                        let scanner = PatternScanner::new(parsed);
+                        let results = scanner.scan_regions(proc.handle.as_ref(), &scan_regions, &modules, true);
+
+                        results.first().map(|r| Address((r.address.0 as i64 + offset) as u64))
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            // Not resolving, just use direct address if available
+            match &entry.locator {
+                AddressLocator::Direct { address } => Some(Address(*address)),
+                _ => None,
+            }
+        };
+
+        // Only add if we have an address
+        if let Some(addr) = address {
+            let entry_id = EntryId(uuid::Uuid::new_v4());
+
+            session.add_watch(WatchEntry {
+                id: entry_id,
+                address: addr,
+                value_type: entry.value_type,
+                label: entry.label.clone(),
+                last_value: None,
+            });
+
+            // Apply freeze if specified
+            if entry.frozen {
+                if let Some(ref value) = entry.freeze_value {
+                    let freeze = FreezeEntry::new(
+                        entry_id,
+                        addr,
+                        entry.value_type,
+                        value.clone(),
+                        100, // Default interval
+                    );
+                    session.set_freeze(entry_id, freeze);
+                }
+            }
+
+            imported += 1;
+        }
+    }
+
+    tracing::info!(
+        table_name = %table.name,
+        imported = imported,
+        total = table.entries.len(),
+        "Imported cheat table entries"
+    );
+
+    Ok(imported)
+}
+
+/// Save cheat table to file
+#[tauri::command]
+fn save_cheat_table_file(path: String, json: String) -> Result<(), String> {
+    std::fs::write(&path, &json)
+        .map_err(|e| format!("Failed to save file: {}", e))
+}
+
+/// Load cheat table from file
+#[tauri::command]
+fn load_cheat_table_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to load file: {}", e))
+}
+
+/// Add a signature to the project
 #[tauri::command]
 fn add_signature(request: AddSignatureRequest, state: State<'_, AppState>) -> Result<String, String> {
     // Validate label length
@@ -1838,10 +1919,11 @@ fn main() {
             audit_log: Mutex::new(audit_log),
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event
-                && let Some(state) = window.try_state::<AppState>() {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<AppState>() {
                     cleanup_on_exit(&state);
                 }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_processes_cmd,
@@ -1859,6 +1941,7 @@ fn main() {
             toggle_freeze,
             write_value,
             read_value,
+            read_memory_bytes,
             // Project commands
             get_project_info,
             new_project,
@@ -1883,6 +1966,15 @@ fn main() {
             set_script_enabled,
             // Pattern scanning commands
             pattern_scan,
+            // Pointer scanning commands
+            pointer_scan,
+            resolve_pointer_chain,
+            // Cheat table commands
+            export_cheat_table,
+            parse_cheat_table,
+            import_cheat_table,
+            save_cheat_table_file,
+            load_cheat_table_file,
             add_signature,
             remove_signature,
             get_signatures,

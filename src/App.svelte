@@ -17,10 +17,13 @@
 
   interface RegionInfo {
     start: string;
+    end: string;
     size: number;
     readable: boolean;
     writable: boolean;
     executable: boolean;
+    module: string | null;
+    preview: string | null;
   }
 
   interface ScanResult {
@@ -35,6 +38,7 @@
     label: string;
     value: string | null;
     frozen: boolean;
+    freeze_value: string | null;
   }
 
   interface ProjectInfo {
@@ -103,10 +107,28 @@
   // Regions
   let regions: RegionInfo[] = $state([]);
   let loadingRegions = $state(false);
+  let regionSortBy = $state<"address" | "size" | "module" | "perms">("address");
+  let regionSortAsc = $state(true);
+  let regionShowAll = $state(false);
+  let regionModuleFilter = $state("");
+
+  // Memory Viewer
+  let memoryViewerOpen = $state(false);
+  let memoryViewerAddress = $state("");
+  let memoryViewerBytes: number[] = $state([]);
+  let memoryViewerLoading = $state(false);
+  let memoryViewerRegion: RegionInfo | null = $state(null);
+  let memoryViewerOffset = $state(0);
+  const BYTES_PER_PAGE = 256; // 16 rows of 16 bytes
 
   // Scan
   let scanValueType = $state("i32");
   let scanValue = $state("");
+  let stringMaxLen = $state(256); // Max length for string scans
+  // Compute effective value type (handles string[N] format)
+  let effectiveValueType = $derived(
+    scanValueType === "string" ? `string[${stringMaxLen}]` : scanValueType
+  );
   let scanResults: ScanResult[] = $state([]);
   let scanning = $state(false);
   let totalScanResults = $state(0);
@@ -121,7 +143,12 @@
   let showManualEntry = $state(false);
   let manualAddress = $state("");
   let manualValueType = $state("i32");
+  let manualStringMaxLen = $state(256); // Max length for manual string watches
   let manualLabel = $state("");
+  // Compute effective manual value type
+  let effectiveManualValueType = $derived(
+    manualValueType === "string" ? `string[${manualStringMaxLen}]` : manualValueType
+  );
   // Inline editing
   let editingWatchId: string | null = $state(null);
   let editingWatchValue = $state("");
@@ -132,6 +159,9 @@
   let showProjectMenu = $state(false);
   let editingProjectName = $state(false);
   let projectNameInput = $state("");
+
+  // Prompt dialog (for new project, etc.)
+  let promptDialog: { title: string; placeholder: string; value: string; onConfirm: (value: string) => void } | null = $state(null);
 
   // Guided Scan Wizard
   let wizardMode = $state(false);
@@ -179,8 +209,9 @@
     };
   }
 
-  let scriptTabs: ScriptTab[] = $state([createNewTab()]);
-  let activeTabId: string = $state(scriptTabs[0].id);
+  const initialTab = createNewTab();
+  let scriptTabs: ScriptTab[] = $state([initialTab]);
+  let activeTabId: string = $state(initialTab.id);
   let savedScripts: SavedScript[] = $state([]);
   let showScriptMenu = $state(false);
   let editingTabName: string | null = $state(null);
@@ -324,7 +355,7 @@
     try {
       scanResults = await invoke<ScanResult[]>("start_scan", {
         request: {
-          value_type: scanValueType,
+          value_type: effectiveValueType,
           comparison: "exact",
           value: scanValue.trim()
         }
@@ -505,7 +536,7 @@
       await invoke<string>("add_watch", {
         request: {
           address: manualAddress.trim(),
-          value_type: manualValueType,
+          value_type: effectiveManualValueType,
           label: manualLabel.trim() || `Manual_${manualAddress.slice(-8)}`
         }
       });
@@ -581,16 +612,20 @@
   }
 
   async function newProject() {
-    const name = prompt("Enter project name:", "New Project");
-    if (name) {
-      try {
-        projectInfo = await invoke<ProjectInfo>("new_project", { name });
-        watches = [];
-        showProjectMenu = false;
-      } catch (e) {
-        error = String(e);
+    promptDialog = {
+      title: "New Project",
+      placeholder: "Project name",
+      value: "New Project",
+      onConfirm: async (name: string) => {
+        try {
+          projectInfo = await invoke<ProjectInfo>("new_project", { name });
+          watches = [];
+          showProjectMenu = false;
+        } catch (e) {
+          error = String(e);
+        }
       }
-    }
+    };
   }
 
   async function saveProject() {
@@ -1093,6 +1128,122 @@
     regions.filter(r => r.writable && r.readable)
   );
 
+  // Sorted and filtered regions
+  const filteredRegions = $derived(() => {
+    let result = regionShowAll ? regions : regions.filter(r => r.writable);
+
+    // Filter by module name
+    if (regionModuleFilter.trim()) {
+      const filter = regionModuleFilter.toLowerCase();
+      result = result.filter(r => r.module?.toLowerCase().includes(filter));
+    }
+
+    // Sort
+    result = [...result].sort((a, b) => {
+      let cmp = 0;
+      switch (regionSortBy) {
+        case "address":
+          cmp = a.start.localeCompare(b.start);
+          break;
+        case "size":
+          cmp = a.size - b.size;
+          break;
+        case "module":
+          cmp = (a.module || "").localeCompare(b.module || "");
+          break;
+        case "perms":
+          const permScore = (r: RegionInfo) => (r.readable ? 4 : 0) + (r.writable ? 2 : 0) + (r.executable ? 1 : 0);
+          cmp = permScore(a) - permScore(b);
+          break;
+      }
+      return regionSortAsc ? cmp : -cmp;
+    });
+
+    return result;
+  });
+
+  function toggleRegionSort(field: "address" | "size" | "module" | "perms") {
+    if (regionSortBy === field) {
+      regionSortAsc = !regionSortAsc;
+    } else {
+      regionSortBy = field;
+      regionSortAsc = field === "address"; // Default ascending for address, descending for others
+    }
+  }
+
+  function copyToClipboard(text: string) {
+    navigator.clipboard.writeText(text);
+    addToast("Copied to clipboard", "success");
+  }
+
+  // Memory Viewer
+  async function openMemoryViewer(region: RegionInfo) {
+    memoryViewerRegion = region;
+    memoryViewerAddress = region.start;
+    memoryViewerOffset = 0;
+    memoryViewerOpen = true;
+    await loadMemoryBytes();
+  }
+
+  async function loadMemoryBytes() {
+    if (!memoryViewerAddress) return;
+    memoryViewerLoading = true;
+    try {
+      // Calculate actual address with offset
+      const baseAddr = parseInt(memoryViewerAddress.replace("0x", ""), 16);
+      const addr = (baseAddr + memoryViewerOffset).toString(16);
+      memoryViewerBytes = await invoke<number[]>("read_memory_bytes", {
+        address: "0x" + addr,
+        size: BYTES_PER_PAGE,
+      });
+    } catch (e) {
+      error = String(e);
+      memoryViewerBytes = [];
+    } finally {
+      memoryViewerLoading = false;
+    }
+  }
+
+  function memoryViewerPrev() {
+    if (memoryViewerOffset >= BYTES_PER_PAGE) {
+      memoryViewerOffset -= BYTES_PER_PAGE;
+      loadMemoryBytes();
+    }
+  }
+
+  function memoryViewerNext() {
+    if (memoryViewerRegion) {
+      const maxOffset = memoryViewerRegion.size - BYTES_PER_PAGE;
+      if (memoryViewerOffset < maxOffset) {
+        memoryViewerOffset = Math.min(memoryViewerOffset + BYTES_PER_PAGE, maxOffset);
+        loadMemoryBytes();
+      }
+    }
+  }
+
+  async function memoryViewerGoTo(addr: string) {
+    const parsed = parseInt(addr.replace("0x", ""), 16);
+    if (!isNaN(parsed)) {
+      const baseAddr = parseInt(memoryViewerAddress.replace("0x", ""), 16);
+      memoryViewerOffset = Math.max(0, parsed - baseAddr);
+      await loadMemoryBytes();
+    }
+  }
+
+  function formatHexByte(b: number): string {
+    return b.toString(16).padStart(2, "0").toUpperCase();
+  }
+
+  function byteToAscii(b: number): string {
+    // Printable ASCII range: 32-126
+    return b >= 32 && b <= 126 ? String.fromCharCode(b) : ".";
+  }
+
+  function getCurrentViewAddress(): string {
+    const baseAddr = parseInt(memoryViewerAddress.replace("0x", ""), 16);
+    return "0x" + (baseAddr + memoryViewerOffset).toString(16).toUpperCase().padStart(16, "0");
+  }
+
   // Console resize handlers
   function startConsoleResize(e: MouseEvent) {
     e.preventDefault();
@@ -1184,20 +1335,41 @@
   }
 
   function highlightPlainCode(code: string): string {
-    const keywords = /\b(const|let|var|function|return|if|else|for|while|async|await|try|catch|throw|new|class|extends|import|export|from|true|false|null|undefined)\b/g;
-    const numbers = /\b(\d+\.?\d*)\b/g;
-    const functions = /\b([a-zA-Z_]\w*)\s*(?=\()/g;
+    const keywords = new Set(['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'async', 'await', 'try', 'catch', 'throw', 'new', 'class', 'extends', 'import', 'export', 'from', 'true', 'false', 'null', 'undefined']);
 
-    let result = code
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+    // Tokenize by word boundaries and other characters
+    const tokenRegex = /([a-zA-Z_]\w*)|(\d+\.?\d*)|([^\w\s])|(\s+)/g;
+    let result = '';
+    let match;
+    let lastIndex = 0;
 
-    // Apply highlighting - order matters for overlapping matches
-    result = result
-      .replace(functions, '<span class="hl-function">$1</span>')
-      .replace(keywords, '<span class="hl-keyword">$1</span>')
-      .replace(numbers, '<span class="hl-number">$1</span>');
+    while ((match = tokenRegex.exec(code)) !== null) {
+      const [full, word, number, punct, space] = match;
+
+      if (word) {
+        // Check if it's a function call (followed by parenthesis)
+        const rest = code.slice(match.index + word.length);
+        const isFunction = /^\s*\(/.test(rest);
+
+        if (keywords.has(word)) {
+          result += `<span class="hl-keyword">${word}</span>`;
+        } else if (isFunction) {
+          result += `<span class="hl-function">${word}</span>`;
+        } else {
+          result += word;
+        }
+      } else if (number) {
+        result += `<span class="hl-number">${number}</span>`;
+      } else if (punct) {
+        // Escape HTML special chars
+        const escaped = punct === '<' ? '&lt;' : punct === '>' ? '&gt;' : punct === '&' ? '&amp;' : punct;
+        result += escaped;
+      } else if (space) {
+        result += space;
+      }
+
+      lastIndex = match.index + full.length;
+    }
 
     return result;
   }
@@ -1534,8 +1706,9 @@
 
                       <div class="wizard-form">
                         <div class="form-group">
-                          <label class="form-label">Name (optional)</label>
+                          <label class="form-label" for="wizard-name">Name (optional)</label>
                           <input
+                            id="wizard-name"
                             type="text"
                             class="form-input"
                             placeholder="e.g., Health, Ammo, Money..."
@@ -1545,20 +1718,35 @@
 
                         <div class="form-row">
                           <div class="form-group">
-                            <label class="form-label">Value Type</label>
-                            <select class="form-select" bind:value={scanValueType}>
+                            <label class="form-label" for="wizard-type">Value Type</label>
+                            <select id="wizard-type" class="form-select" bind:value={scanValueType}>
                               <option value="i32">Integer (most common)</option>
                               <option value="f32">Decimal (Float)</option>
                               <option value="f64">Decimal (Double)</option>
                               <option value="i64">Large Integer</option>
+                              <option value="string">Text/String</option>
                             </select>
                           </div>
+                          {#if scanValueType === "string"}
+                            <div class="form-group" style="width: 80px;">
+                              <label class="form-label" for="wizard-strlen">Max Len</label>
+                              <input
+                                id="wizard-strlen"
+                                type="number"
+                                class="form-input"
+                                min="1"
+                                max="4096"
+                                bind:value={stringMaxLen}
+                              />
+                            </div>
+                          {/if}
                           <div class="form-group flex-1">
-                            <label class="form-label">Current Value</label>
+                            <label class="form-label" for="wizard-value">Current Value</label>
                             <input
+                              id="wizard-value"
                               type="text"
                               class="form-input"
-                              placeholder="e.g., 100"
+                              placeholder={scanValueType === "string" ? "e.g., PlayerName" : "e.g., 100"}
                               bind:value={scanValue}
                               onkeydown={(e) => e.key === 'Enter' && wizardFirstScan()}
                             />
@@ -1596,29 +1784,29 @@
                         </div>
 
                         <div class="wizard-refine-options">
-                          <div class="refine-option" onclick={() => wizardRefine("changed")}>
+                          <button type="button" class="refine-option" onclick={() => wizardRefine("changed")}>
                             <div class="refine-option-icon">↕</div>
                             <div class="refine-option-text">
                               <strong>Value Changed</strong>
                               <span>I changed the value but don't know the new amount</span>
                             </div>
-                          </div>
+                          </button>
 
-                          <div class="refine-option" onclick={() => wizardRefine("decreased")}>
+                          <button type="button" class="refine-option" onclick={() => wizardRefine("decreased")}>
                             <div class="refine-option-icon">↓</div>
                             <div class="refine-option-text">
                               <strong>Value Decreased</strong>
                               <span>The value went down (took damage, spent money)</span>
                             </div>
-                          </div>
+                          </button>
 
-                          <div class="refine-option" onclick={() => wizardRefine("increased")}>
+                          <button type="button" class="refine-option" onclick={() => wizardRefine("increased")}>
                             <div class="refine-option-icon">↑</div>
                             <div class="refine-option-text">
                               <strong>Value Increased</strong>
                               <span>The value went up (healed, earned money)</span>
                             </div>
-                          </div>
+                          </button>
 
                           <div class="refine-option exact-option">
                             <div class="refine-option-icon">=</div>
@@ -1660,15 +1848,15 @@
 
                       <div class="wizard-results">
                         {#each scanResults as result (result.address)}
-                          <div class="wizard-result-item" onclick={() => wizardAddToWatch(result.address, result.value)}>
+                          <button type="button" class="wizard-result-item" onclick={() => wizardAddToWatch(result.address, result.value)}>
                             <div class="wizard-result-info">
                               <span class="mono">{result.address}</span>
                               <span class="wizard-result-value">{result.value}</span>
                             </div>
-                            <button class="btn btn-primary btn-sm">
+                            <span class="btn btn-primary btn-sm">
                               Select This
-                            </button>
-                          </div>
+                            </span>
+                          </button>
                         {/each}
                       </div>
 
@@ -1745,28 +1933,43 @@
                   {#if !hasPreviousScan}
                     <div class="form-row">
                       <div class="form-group">
-                        <label class="form-label">Type</label>
-                        <select class="form-select" bind:value={scanValueType}>
+                        <label class="form-label" for="scan-type">Type</label>
+                        <select id="scan-type" class="form-select" bind:value={scanValueType}>
                           <option value="i32">Int32</option>
                           <option value="i64">Int64</option>
                           <option value="u32">UInt32</option>
                           <option value="u64">UInt64</option>
                           <option value="f32">Float</option>
                           <option value="f64">Double</option>
+                          <option value="string">String</option>
                         </select>
                       </div>
+                      {#if scanValueType === "string"}
+                        <div class="form-group" style="width: 80px;">
+                          <label class="form-label" for="scan-strlen">Max Len</label>
+                          <input
+                            id="scan-strlen"
+                            type="number"
+                            class="form-input"
+                            min="1"
+                            max="4096"
+                            bind:value={stringMaxLen}
+                          />
+                        </div>
+                      {/if}
                       <div class="form-group flex-1">
-                        <label class="form-label">Value</label>
+                        <label class="form-label" for="scan-value">Value</label>
                         <input
+                          id="scan-value"
                           type="text"
                           class="form-input"
-                          placeholder="Enter value to find..."
+                          placeholder={scanValueType === "string" ? "Enter text to find..." : "Enter value to find..."}
                           bind:value={scanValue}
                           onkeydown={(e) => e.key === 'Enter' && startScan()}
                         />
                       </div>
                       <div class="form-group">
-                        <label class="form-label">&nbsp;</label>
+                        <span class="form-label" aria-hidden="true">&nbsp;</span>
                         <button class="btn btn-primary" onclick={startScan} disabled={scanning}>
                           {#if scanning}
                             <div class="btn-spinner"></div>
@@ -1948,8 +2151,22 @@
                         <option value="i16">Int16</option>
                         <option value="u8">UInt8</option>
                         <option value="u16">UInt16</option>
+                        <option value="string">String</option>
                       </select>
                     </div>
+                    {#if manualValueType === "string"}
+                      <div class="form-group" style="width: 80px;">
+                        <label class="form-label" for="manual-strlen">Max Len</label>
+                        <input
+                          id="manual-strlen"
+                          type="number"
+                          class="form-input"
+                          min="1"
+                          max="4096"
+                          bind:value={manualStringMaxLen}
+                        />
+                      </div>
+                    {/if}
                     <div class="form-group flex-1">
                       <label class="form-label" for="manual-label">Label (optional)</label>
                       <input
@@ -1961,7 +2178,7 @@
                       />
                     </div>
                     <div class="form-group">
-                      <label class="form-label">&nbsp;</label>
+                      <span class="form-label" aria-hidden="true">&nbsp;</span>
                       <button class="btn btn-primary" onclick={addManualWatch} title="Add address to watch list">
                         Add
                       </button>
@@ -2094,42 +2311,120 @@
               <div class="card flex-1">
                 <div class="card-header">
                   <h3>Memory Regions</h3>
-                  <span class="results-count">{writableRegions.length} writable</span>
+                  <span class="results-count">{filteredRegions().length} shown / {regions.length} total</span>
                 </div>
+
+                <!-- Regions Toolbar -->
+                <div class="regions-toolbar">
+                  <div class="regions-filters">
+                    <label class="toggle-label">
+                      <input type="checkbox" bind:checked={regionShowAll} />
+                      <span>Show all regions</span>
+                    </label>
+                    <input
+                      type="text"
+                      class="form-input form-input-sm"
+                      placeholder="Filter by module..."
+                      bind:value={regionModuleFilter}
+                    />
+                    {#if regionModuleFilter}
+                      <button class="btn-clear" onclick={() => regionModuleFilter = ""} title="Clear filter">×</button>
+                    {/if}
+                  </div>
+                  <span class="regions-hint">Click column headers to sort</span>
+                </div>
+
                 <div class="regions-table-container">
                   {#if loadingRegions}
                     <div class="loading-state">
                       <div class="loading-spinner"></div>
                       <span>Loading regions...</span>
                     </div>
-                  {:else if writableRegions.length > 0}
-                    <table class="results-table">
+                  {:else if filteredRegions().length > 0}
+                    <table class="regions-table">
                       <thead>
                         <tr>
-                          <th>Address</th>
-                          <th>Size</th>
-                          <th>Permissions</th>
+                          <th class="col-addr sortable" class:sorted={regionSortBy === "address"} onclick={() => toggleRegionSort("address")}>
+                            Start {regionSortBy === "address" ? (regionSortAsc ? "↑" : "↓") : ""}
+                          </th>
+                          <th class="col-addr">End</th>
+                          <th class="col-size sortable" class:sorted={regionSortBy === "size"} onclick={() => toggleRegionSort("size")}>
+                            Size {regionSortBy === "size" ? (regionSortAsc ? "↑" : "↓") : ""}
+                          </th>
+                          <th class="col-perms sortable" class:sorted={regionSortBy === "perms"} onclick={() => toggleRegionSort("perms")}>
+                            Perms {regionSortBy === "perms" ? (regionSortAsc ? "↑" : "↓") : ""}
+                          </th>
+                          <th class="col-module sortable" class:sorted={regionSortBy === "module"} onclick={() => toggleRegionSort("module")}>
+                            Module {regionSortBy === "module" ? (regionSortAsc ? "↑" : "↓") : ""}
+                          </th>
+                          <th class="col-preview">Preview</th>
+                          <th class="col-actions"></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {#each writableRegions as region (region.start)}
-                          <tr>
-                            <td class="mono">{region.start}</td>
-                            <td>{formatSize(region.size)}</td>
-                            <td>
-                              <div class="perm-badges">
-                                {#if region.readable}<span class="perm-badge read">R</span>{/if}
-                                {#if region.writable}<span class="perm-badge write">W</span>{/if}
-                                {#if region.executable}<span class="perm-badge exec">X</span>{/if}
-                              </div>
+                        {#each filteredRegions() as region (region.start)}
+                          <tr class:non-writable={!region.writable}>
+                            <td class="col-addr">
+                              <button
+                                class="addr-btn mono"
+                                onclick={() => copyToClipboard(region.start)}
+                                title="Click to copy"
+                              >{region.start}</button>
+                            </td>
+                            <td class="col-addr">
+                              <button
+                                class="addr-btn mono"
+                                onclick={() => copyToClipboard(region.end)}
+                                title="Click to copy"
+                              >{region.end}</button>
+                            </td>
+                            <td class="col-size">{formatSize(region.size)}</td>
+                            <td class="col-perms">
+                              <span class="region-perms">
+                                <span class="perm" class:active={region.readable}>R</span><span class="perm" class:active={region.writable}>W</span><span class="perm" class:active={region.executable}>X</span>
+                              </span>
+                            </td>
+                            <td class="col-module">
+                              {#if region.module}
+                                <button
+                                  class="region-module"
+                                  title="Click to filter by this module"
+                                  onclick={() => regionModuleFilter = region.module || ""}
+                                >{region.module}</button>
+                              {:else}
+                                <span class="no-module">-</span>
+                              {/if}
+                            </td>
+                            <td class="col-preview">
+                              {#if region.preview}
+                                <span class="mono preview-text">{region.preview}</span>
+                              {:else}
+                                <span class="no-preview">-</span>
+                              {/if}
+                            </td>
+                            <td class="col-actions">
+                              {#if region.readable}
+                                <button
+                                  class="btn-view"
+                                  onclick={() => openMemoryViewer(region)}
+                                  title="Open in Memory Viewer"
+                                >View</button>
+                              {/if}
                             </td>
                           </tr>
                         {/each}
                       </tbody>
                     </table>
+                  {:else if regions.length > 0}
+                    <div class="empty-results">
+                      <p>No regions match filters</p>
+                      <button class="btn btn-secondary btn-sm" onclick={() => { regionShowAll = true; regionModuleFilter = ""; }}>
+                        Clear filters
+                      </button>
+                    </div>
                   {:else}
                     <div class="empty-results">
-                      <p>No writable regions found</p>
+                      <p>No memory regions found</p>
                     </div>
                   {/if}
                 </div>
@@ -2166,7 +2461,7 @@
                     />
                   </div>
                   <div class="form-group">
-                    <label class="form-label">&nbsp;</label>
+                    <span class="form-label" aria-hidden="true">&nbsp;</span>
                     <button class="btn btn-primary" onclick={runPatternScan} disabled={patternScanning || !attachedProcess} title={attachedProcess ? "Search memory for byte pattern" : "Attach to a process first"}>
                       {#if patternScanning}
                         <span class="btn-spinner-small"></span>
@@ -2403,7 +2698,8 @@
       <!-- Bottom Console Panel -->
       {#if consoleOpen}
         <div class="console-panel" style="height: {consoleHeight}px" class:resizing={isResizingConsole}>
-          <div class="console-resize-handle" onmousedown={startConsoleResize}></div>
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <div class="console-resize-handle" role="separator" aria-orientation="horizontal" onmousedown={startConsoleResize}></div>
           <div class="console-header">
             <!-- Script Tabs -->
             <div class="script-tabs">
@@ -2416,6 +2712,7 @@
                   title={tab.name}
                 >
                   {#if editingTabName === tab.id}
+                    <!-- svelte-ignore a11y_autofocus -->
                     <input
                       type="text"
                       class="tab-name-input"
@@ -2434,11 +2731,14 @@
                     {/if}
                   {/if}
                   {#if scriptTabs.length > 1}
-                    <button
+                    <span
                       class="tab-close"
+                      role="button"
+                      tabindex="0"
                       onclick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
+                      onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); closeTab(tab.id); }}}
                       title="Close tab"
-                    >×</button>
+                    >×</span>
                   {/if}
                 </button>
               {/each}
@@ -2685,6 +2985,135 @@ for (let i = 0; i &lt; 10; i++) {'{'}
         <span class="toast-message">{toast.message}</span>
       </div>
     {/each}
+  </div>
+{/if}
+
+<!-- Prompt Dialog Modal -->
+{#if promptDialog}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => promptDialog = null} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3>{promptDialog.title}</h3>
+        <button class="modal-close" onclick={() => promptDialog = null}>&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          type="text"
+          class="form-input"
+          placeholder={promptDialog.placeholder}
+          bind:value={promptDialog.value}
+          autofocus
+          onkeydown={(e) => {
+            if (e.key === 'Enter' && promptDialog) {
+              promptDialog.onConfirm(promptDialog.value);
+              promptDialog = null;
+            } else if (e.key === 'Escape') {
+              promptDialog = null;
+            }
+          }}
+        />
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick={() => promptDialog = null}>Cancel</button>
+        <button class="btn btn-primary" onclick={() => {
+          if (promptDialog) {
+            promptDialog.onConfirm(promptDialog.value);
+            promptDialog = null;
+          }
+        }}>OK</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Memory Viewer Modal -->
+{#if memoryViewerOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => memoryViewerOpen = false} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="memory-viewer-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3>Memory Viewer</h3>
+        <div class="memory-viewer-info">
+          {#if memoryViewerRegion}
+            <span class="region-badge">{memoryViewerRegion.module || "Unknown"}</span>
+            <span class="mono">{getCurrentViewAddress()}</span>
+          {/if}
+        </div>
+        <button class="modal-close" onclick={() => memoryViewerOpen = false}>&times;</button>
+      </div>
+
+      <div class="memory-viewer-toolbar">
+        <div class="memory-nav">
+          <button
+            class="btn btn-sm btn-secondary"
+            onclick={memoryViewerPrev}
+            disabled={memoryViewerOffset === 0}
+          >← Prev</button>
+          <button
+            class="btn btn-sm btn-secondary"
+            onclick={memoryViewerNext}
+            disabled={!memoryViewerRegion || memoryViewerOffset >= memoryViewerRegion.size - BYTES_PER_PAGE}
+          >Next →</button>
+        </div>
+        <div class="memory-offset">
+          Offset: <span class="mono">+{memoryViewerOffset.toString(16).toUpperCase()}</span>
+        </div>
+        <button class="btn btn-sm btn-secondary" onclick={loadMemoryBytes}>Refresh</button>
+      </div>
+
+      <div class="memory-viewer-content">
+        {#if memoryViewerLoading}
+          <div class="loading-state">
+            <div class="loading-spinner"></div>
+            <span>Reading memory...</span>
+          </div>
+        {:else if memoryViewerBytes.length > 0}
+          <div class="hex-view">
+            <div class="hex-header">
+              <span class="hex-addr-header">Address</span>
+              <span class="hex-bytes-header">
+                {#each Array(16) as _, i}
+                  <span class="hex-col-num">{i.toString(16).toUpperCase()}</span>
+                {/each}
+              </span>
+              <span class="hex-ascii-header">ASCII</span>
+            </div>
+            <div class="hex-rows">
+              {#each Array(Math.ceil(memoryViewerBytes.length / 16)) as _, row}
+                {@const rowAddr = parseInt(memoryViewerAddress.replace("0x", ""), 16) + memoryViewerOffset + row * 16}
+                {@const rowBytes = memoryViewerBytes.slice(row * 16, (row + 1) * 16)}
+                <div class="hex-row">
+                  <span class="hex-addr mono">{("0x" + rowAddr.toString(16).toUpperCase().padStart(16, "0"))}</span>
+                  <span class="hex-bytes mono">
+                    {#each rowBytes as byte, i}
+                      <span class="hex-byte" class:zero={byte === 0} class:high={byte >= 128}>{formatHexByte(byte)}</span>{#if i === 7}<span class="hex-separator"></span>{/if}
+                    {/each}
+                    {#if rowBytes.length < 16}
+                      {#each Array(16 - rowBytes.length) as _}
+                        <span class="hex-byte empty">  </span>
+                      {/each}
+                    {/if}
+                  </span>
+                  <span class="hex-ascii mono">
+                    {#each rowBytes as byte}
+                      <span class="ascii-char" class:printable={byte >= 32 && byte <= 126}>{byteToAscii(byte)}</span>
+                    {/each}
+                  </span>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {:else}
+          <div class="empty-results">
+            <p>Unable to read memory at this address</p>
+          </div>
+        {/if}
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -3546,6 +3975,213 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   .perm-badge.exec {
     background: #fef3c7;
     color: #92400e;
+  }
+
+  /* Regions toolbar */
+  .regions-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+
+  .regions-filters {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .toggle-label input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+  }
+
+  .form-input-sm {
+    padding: 4px 8px;
+    font-size: 11px;
+    height: 26px;
+  }
+
+  .regions-hint {
+    font-size: 11px;
+    color: var(--text-secondary);
+    opacity: 0.7;
+  }
+
+  .btn-clear {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0 4px;
+    line-height: 1;
+  }
+
+  .btn-clear:hover {
+    color: var(--text);
+  }
+
+  /* Regions table */
+  .regions-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+
+  .regions-table thead {
+    position: sticky;
+    top: 0;
+    background: var(--card-bg);
+    z-index: 1;
+  }
+
+  .regions-table th {
+    padding: 6px 8px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  .regions-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .regions-table th.sortable:hover {
+    background: var(--hover-bg);
+    color: var(--text);
+  }
+
+  .regions-table th.sorted {
+    color: var(--primary);
+  }
+
+  .regions-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+
+  .regions-table tbody tr:hover {
+    background: var(--hover-bg);
+  }
+
+  .regions-table tbody tr.non-writable {
+    opacity: 0.4;
+  }
+
+  .regions-table tbody tr.non-writable:hover {
+    opacity: 0.7;
+  }
+
+  .regions-table .col-addr {
+    white-space: nowrap;
+  }
+
+  .regions-table .col-size {
+    text-align: right;
+    white-space: nowrap;
+    color: var(--text-secondary);
+  }
+
+  .regions-table .col-perms {
+    text-align: center;
+  }
+
+  .regions-table .col-module {
+    max-width: 140px;
+  }
+
+  .regions-table .col-preview {
+    max-width: 200px;
+  }
+
+  .addr-btn {
+    background: none;
+    border: none;
+    padding: 2px 4px;
+    margin: -2px -4px;
+    border-radius: 3px;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+  }
+
+  .addr-btn:hover {
+    background: var(--border);
+  }
+
+  .region-perms {
+    display: inline-flex;
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+
+  .region-perms .perm {
+    width: 14px;
+    text-align: center;
+    color: var(--text-secondary);
+    opacity: 0.3;
+  }
+
+  .region-perms .perm.active {
+    opacity: 1;
+  }
+
+  .region-perms .perm.active:nth-child(1) { color: #3b82f6; }
+  .region-perms .perm.active:nth-child(2) { color: #22c55e; }
+  .region-perms .perm.active:nth-child(3) { color: #f59e0b; }
+
+  .region-module {
+    background: var(--border);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border: none;
+    cursor: pointer;
+    color: var(--text);
+    display: block;
+  }
+
+  .region-module:hover {
+    background: var(--primary);
+    color: white;
+  }
+
+  .no-module, .no-preview {
+    color: var(--text-secondary);
+    opacity: 0.5;
+  }
+
+  .preview-text {
+    color: var(--text-secondary);
+    font-size: 10px;
+    letter-spacing: 0.3px;
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .empty-results, .loading-state {
@@ -4933,5 +5569,278 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   .dropdown-delete svg {
     width: 14px;
     height: 14px;
+  }
+
+  /* Modal Dialog */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    backdrop-filter: blur(2px);
+  }
+
+  .modal-dialog {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 320px;
+    max-width: 90vw;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    font-size: 20px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+  }
+
+  .modal-close:hover {
+    color: var(--text);
+  }
+
+  .modal-body {
+    padding: 16px;
+  }
+
+  .modal-body .form-input {
+    width: 100%;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* View button in regions table */
+  .btn-view {
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    background: #3b82f6;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .btn-view:hover {
+    background: #2563eb;
+  }
+
+  .regions-table .col-actions {
+    width: 60px;
+    text-align: center;
+  }
+
+  /* Memory Viewer Modal */
+  .memory-viewer-modal {
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    width: 90vw;
+    max-width: 1000px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .memory-viewer-modal .modal-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #3a3a3a;
+    background: #252525;
+  }
+
+  .memory-viewer-modal .modal-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #e0e0e0;
+  }
+
+  .memory-viewer-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+  }
+
+  .memory-viewer-info .mono {
+    color: #9ca3af;
+    font-size: 12px;
+  }
+
+  .region-badge {
+    background: #3b82f6;
+    color: white;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
+
+  .memory-viewer-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 8px 16px;
+    border-bottom: 1px solid #3a3a3a;
+    background: #1a1a1a;
+  }
+
+  .memory-nav {
+    display: flex;
+    gap: 4px;
+  }
+
+  .memory-offset {
+    font-size: 12px;
+    color: #9ca3af;
+  }
+
+  .memory-viewer-content {
+    flex: 1;
+    overflow: auto;
+    padding: 0;
+    background: #1e1e1e;
+  }
+
+  /* Hex View */
+  .hex-view {
+    font-size: 12px;
+  }
+
+  .hex-header {
+    display: flex;
+    padding: 6px 12px;
+    background: #252525;
+    border-bottom: 1px solid #3a3a3a;
+    font-weight: 600;
+    color: #6b7280;
+    font-size: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .hex-addr-header {
+    width: 160px;
+    flex-shrink: 0;
+  }
+
+  .hex-bytes-header {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+  }
+
+  .hex-col-num {
+    width: 20px;
+    text-align: center;
+  }
+
+  .hex-col-num:nth-child(9) {
+    margin-left: 8px;
+  }
+
+  .hex-ascii-header {
+    width: 140px;
+    flex-shrink: 0;
+    text-align: center;
+  }
+
+  .hex-rows {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .hex-row {
+    display: flex;
+    padding: 3px 12px;
+    border-bottom: 1px solid #2a2a2a;
+  }
+
+  .hex-row:hover {
+    background: #2a2a2a;
+  }
+
+  .hex-addr {
+    width: 160px;
+    flex-shrink: 0;
+    color: #6b7280;
+    font-size: 11px;
+  }
+
+  .hex-bytes {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+  }
+
+  .hex-byte {
+    width: 20px;
+    text-align: center;
+    color: #e0e0e0;
+  }
+
+  .hex-byte.zero {
+    color: #4b5563;
+  }
+
+  .hex-byte.high {
+    color: #f59e0b;
+  }
+
+  .hex-byte.empty {
+    opacity: 0;
+  }
+
+  .hex-separator {
+    width: 8px;
+  }
+
+  .hex-ascii {
+    width: 140px;
+    flex-shrink: 0;
+    letter-spacing: 1px;
+    background: #252525;
+    padding: 2px 8px;
+    border-radius: 3px;
+  }
+
+  .ascii-char {
+    color: #4b5563;
+  }
+
+  .ascii-char.printable {
+    color: #10b981;
   }
 </style>
