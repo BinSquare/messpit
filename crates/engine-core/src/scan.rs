@@ -394,11 +394,12 @@ pub fn decode_at(data: &[u8], ty: &ValueType) -> Option<Value> {
         }
         ValueType::Bytes { len } if data.len() >= *len => Some(Value::Bytes(data[..*len].to_vec())),
         ValueType::String { max_len } => {
-            let end = data
+            // Clamp to actual data length to avoid out-of-bounds
+            let search_len = data.len().min(*max_len);
+            let end = data[..search_len]
                 .iter()
-                .take(*max_len)
                 .position(|&b| b == 0)
-                .unwrap_or(*max_len);
+                .unwrap_or(search_len);
             String::from_utf8(data[..end].to_vec())
                 .ok()
                 .map(Value::String)
@@ -691,5 +692,33 @@ mod tests {
             ScanEngine::initial_scan_with_cancel(&data, Address(0), &params, Some(&callback), None);
 
         assert!(progress_count.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn test_decode_string() {
+        // Normal null-terminated string
+        let data = b"Hello\0World";
+        let result = decode_at(data, &ValueType::String { max_len: 256 });
+        assert_eq!(result, Some(Value::String("Hello".to_string())));
+
+        // String without null terminator (uses full length)
+        let data = b"Hello";
+        let result = decode_at(data, &ValueType::String { max_len: 256 });
+        assert_eq!(result, Some(Value::String("Hello".to_string())));
+
+        // Small slice with large max_len (edge case that caused panic)
+        let data = b"A";
+        let result = decode_at(data, &ValueType::String { max_len: 256 });
+        assert_eq!(result, Some(Value::String("A".to_string())));
+
+        // Empty slice
+        let data: &[u8] = b"";
+        let result = decode_at(data, &ValueType::String { max_len: 256 });
+        assert_eq!(result, Some(Value::String("".to_string())));
+
+        // String longer than max_len gets truncated
+        let data = b"Hello World";
+        let result = decode_at(data, &ValueType::String { max_len: 5 });
+        assert_eq!(result, Some(Value::String("Hello".to_string())));
     }
 }

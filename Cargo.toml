@@ -4,7 +4,7 @@ members = ["crates/*", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "MIT"
 repository = "https://github.com/user/messpit"
 
@@ -42,6 +42,7 @@ features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
+    "Win32_Security",
 ]
 
 [workspace.dependencies.libc]
