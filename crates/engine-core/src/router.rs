@@ -12,6 +12,7 @@ use messpit_protocol::{
 
 use crate::{
     pattern::{Pattern, PatternScanner},
+    scan::{decode_at, encode_value},
     EngineTransport, EventSender, Project, SharedSession, WatchEntry,
 };
 
@@ -423,7 +424,7 @@ impl Router {
             let mut buffer = vec![0u8; size];
             match process.read_memory(addr, &mut buffer) {
                 Ok(read) if read >= size => {
-                    let value = decode_value(&buffer, &ty);
+                    let value = decode_at(&buffer, &ty);
                     results.push((addr, value));
                 }
                 _ => {
@@ -598,9 +599,12 @@ impl Router {
         &self,
         scan_id: messpit_protocol::ScanId,
         offset: usize,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Vec<EngineEvent>, EngineError> {
-        // TODO: Implement pagination with limit
+        // Note: Scan results are managed by Tauri commands, not the engine router.
+        // This stub exists for protocol completeness. The Tauri layer handles
+        // scan state and pagination directly for better integration with the UI.
+        let _ = limit; // Acknowledge parameter
         Ok(vec![EngineEvent::ScanResultsPage {
             scan_id,
             offset,
@@ -765,12 +769,13 @@ impl Router {
         &self,
         job_id: JobId,
     ) -> Result<Vec<EngineEvent>, EngineError> {
-        if let Ok(jobs) = self.jobs.read()
-            && let Some(job) = jobs.get(&job_id) {
+        if let Ok(jobs) = self.jobs.read() {
+            if let Some(job) = jobs.get(&job_id) {
                 job.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                 self.record_audit("cancel_job", None, None, Some(&format!("job_id: {:?}", job_id)));
                 return Ok(vec![]);
             }
+        }
 
         Err(EngineError::new(
             ErrorCode::InternalError,
@@ -854,8 +859,8 @@ impl Router {
             });
 
             // Restore freeze if applicable
-            if entry.frozen
-                && let Some(ref value) = entry.freeze_value {
+            if entry.frozen {
+                if let Some(ref value) = entry.freeze_value {
                     let freeze = crate::FreezeEntry::new(
                         entry_id,
                         Address(entry.address),
@@ -865,6 +870,7 @@ impl Router {
                     );
                     session.set_freeze(entry_id, freeze);
                 }
+            }
         }
 
         drop(session);
@@ -875,68 +881,106 @@ impl Router {
     }
 }
 
-/// Decode bytes into a typed value
-fn decode_value(bytes: &[u8], ty: &messpit_protocol::ValueType) -> Option<messpit_protocol::Value> {
+#[cfg(test)]
+mod tests {
+    use super::*;
     use messpit_protocol::{Value, ValueType};
 
-    match ty {
-        ValueType::I8 if !bytes.is_empty() => Some(Value::I8(i8::from_le_bytes([bytes[0]]))),
-        ValueType::I16 if bytes.len() >= 2 => {
-            Some(Value::I16(i16::from_le_bytes([bytes[0], bytes[1]])))
-        }
-        ValueType::I32 if bytes.len() >= 4 => Some(Value::I32(i32::from_le_bytes(
-            bytes[..4].try_into().unwrap(),
-        ))),
-        ValueType::I64 if bytes.len() >= 8 => Some(Value::I64(i64::from_le_bytes(
-            bytes[..8].try_into().unwrap(),
-        ))),
-        ValueType::U8 if !bytes.is_empty() => Some(Value::U8(bytes[0])),
-        ValueType::U16 if bytes.len() >= 2 => {
-            Some(Value::U16(u16::from_le_bytes([bytes[0], bytes[1]])))
-        }
-        ValueType::U32 if bytes.len() >= 4 => Some(Value::U32(u32::from_le_bytes(
-            bytes[..4].try_into().unwrap(),
-        ))),
-        ValueType::U64 if bytes.len() >= 8 => Some(Value::U64(u64::from_le_bytes(
-            bytes[..8].try_into().unwrap(),
-        ))),
-        ValueType::F32 if bytes.len() >= 4 => Some(Value::F32(f32::from_le_bytes(
-            bytes[..4].try_into().unwrap(),
-        ))),
-        ValueType::F64 if bytes.len() >= 8 => Some(Value::F64(f64::from_le_bytes(
-            bytes[..8].try_into().unwrap(),
-        ))),
-        ValueType::Bytes { len } if bytes.len() >= *len => {
-            Some(Value::Bytes(bytes[..*len].to_vec()))
-        }
-        ValueType::String { max_len } => {
-            let end = bytes.iter().take(*max_len).position(|&b| b == 0).unwrap_or(*max_len);
-            String::from_utf8(bytes[..end].to_vec()).ok().map(Value::String)
-        }
-        _ => None,
+    #[test]
+    fn test_audit_log_new() {
+        let log = AuditLog::new(100);
+        assert!(log.entries.is_empty());
+        assert_eq!(log.max_entries, 100);
     }
-}
 
-/// Encode a typed value into bytes
-fn encode_value(value: &messpit_protocol::Value) -> Vec<u8> {
-    use messpit_protocol::Value;
+    #[test]
+    fn test_audit_log_record() {
+        let mut log = AuditLog::new(10);
+        let entry = log.record("test_op", Some(1234), Some(Address(0x1000)), Some("details"));
 
-    match value {
-        Value::I8(v) => v.to_le_bytes().to_vec(),
-        Value::I16(v) => v.to_le_bytes().to_vec(),
-        Value::I32(v) => v.to_le_bytes().to_vec(),
-        Value::I64(v) => v.to_le_bytes().to_vec(),
-        Value::U8(v) => vec![*v],
-        Value::U16(v) => v.to_le_bytes().to_vec(),
-        Value::U32(v) => v.to_le_bytes().to_vec(),
-        Value::U64(v) => v.to_le_bytes().to_vec(),
-        Value::F32(v) => v.to_le_bytes().to_vec(),
-        Value::F64(v) => v.to_le_bytes().to_vec(),
-        Value::Bytes(v) => v.clone(),
-        Value::String(v) => {
-            let mut bytes = v.as_bytes().to_vec();
-            bytes.push(0); // Null terminate
-            bytes
-        }
+        assert_eq!(entry.operation, "test_op");
+        assert_eq!(entry.target_pid, Some(1234));
+        assert_eq!(entry.address, Some(Address(0x1000)));
+        assert_eq!(entry.details, Some("details".to_string()));
+        assert_eq!(log.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_audit_log_max_entries() {
+        let mut log = AuditLog::new(3);
+
+        log.record("op1", None, None, None);
+        log.record("op2", None, None, None);
+        log.record("op3", None, None, None);
+        log.record("op4", None, None, None); // Should evict op1
+
+        assert_eq!(log.entries.len(), 3);
+        let entries = log.entries();
+        assert_eq!(entries[0].operation, "op2");
+        assert_eq!(entries[2].operation, "op4");
+    }
+
+    #[test]
+    fn test_audit_log_clear() {
+        let mut log = AuditLog::new(10);
+        log.record("op", None, None, None);
+        assert_eq!(log.entries.len(), 1);
+
+        log.clear();
+        assert!(log.entries.is_empty());
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip_i32() {
+        use crate::scan::{decode_at, encode_value};
+
+        let original = Value::I32(-12345);
+        let encoded = encode_value(&original);
+        let decoded = decode_at(&encoded, &ValueType::I32);
+
+        assert_eq!(decoded, Some(original));
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip_u64() {
+        use crate::scan::{decode_at, encode_value};
+
+        let original = Value::U64(0xDEADBEEFCAFEBABE);
+        let encoded = encode_value(&original);
+        let decoded = decode_at(&encoded, &ValueType::U64);
+
+        assert_eq!(decoded, Some(original));
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip_f64() {
+        use crate::scan::{decode_at, encode_value};
+
+        let original = Value::F64(3.141592653589793);
+        let encoded = encode_value(&original);
+        let decoded = decode_at(&encoded, &ValueType::F64);
+
+        assert_eq!(decoded, Some(original));
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip_string() {
+        use crate::scan::{decode_at, encode_value};
+
+        let original = Value::String("Hello, World!".to_string());
+        let encoded = encode_value(&original);
+        let decoded = decode_at(&encoded, &ValueType::String { max_len: 100 });
+
+        assert_eq!(decoded, Some(original));
+    }
+
+    #[test]
+    fn test_decode_insufficient_bytes() {
+        use crate::scan::decode_at;
+
+        let bytes = [0x12, 0x34]; // Only 2 bytes
+        assert!(decode_at(&bytes, &ValueType::I32).is_none());
+        assert!(decode_at(&bytes, &ValueType::I64).is_none());
+        assert!(decode_at(&bytes, &ValueType::F64).is_none());
     }
 }

@@ -10,6 +10,10 @@ use crate::{HostRequest, HostResponse, ScriptConfig};
 use messpit_protocol::{Value, ValueType};
 
 /// Host API context that handles requests from scripts
+///
+/// Note: This struct is currently unused as script execution is handled directly
+/// through the ScriptHost runtime. It's kept for potential future refactoring
+/// to provide a cleaner abstraction layer between scripts and the engine.
 #[allow(dead_code)]
 pub struct HostApi<F>
 where
@@ -20,6 +24,7 @@ where
     config: ScriptConfig,
 }
 
+// Implementation kept for potential future use (see struct doc comment)
 #[allow(dead_code)]
 impl<F> HostApi<F>
 where
@@ -202,14 +207,14 @@ mod tests {
     #[test]
     fn test_js_to_value() {
         assert_eq!(js_to_value(42.0, ValueType::I32), Some(Value::I32(42)));
-        assert_eq!(js_to_value(3.14, ValueType::F32), Some(Value::F32(3.14)));
+        assert_eq!(js_to_value(2.5, ValueType::F32), Some(Value::F32(2.5)));
         assert_eq!(js_to_value(255.0, ValueType::U8), Some(Value::U8(255)));
     }
 
     #[test]
     fn test_value_to_js() {
         assert_eq!(value_to_js(&Value::I32(42)), 42.0);
-        assert_eq!(value_to_js(&Value::F64(3.14)), 3.14);
+        assert_eq!(value_to_js(&Value::F64(2.5)), 2.5);
         assert_eq!(value_to_js(&Value::U8(255)), 255.0);
     }
 }

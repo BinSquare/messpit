@@ -202,10 +202,11 @@ impl DenseScanState {
         let mut results = Vec::with_capacity(self.match_count);
 
         for pos in 0..num_positions {
-            if self.is_valid(pos)
-                && let Some(value) = self.value_at(pos) {
+            if self.is_valid(pos) {
+                if let Some(value) = self.value_at(pos) {
                     results.push((self.address_at(pos), value));
                 }
+            }
         }
 
         results
@@ -268,10 +269,11 @@ impl ScanEngine {
                         let addr = Address(base.0 + offset as u64);
                         let slice = &data[offset..offset + size];
 
-                        if let Some(value) = decode_at(slice, &params.value_type)
-                            && matches_comparison(&value, &params.comparison) {
+                        if let Some(value) = decode_at(slice, &params.value_type) {
+                            if matches_comparison(&value, &params.comparison) {
                                 return Some((addr, value));
                             }
+                        }
                         None
                     })
                     .collect();
@@ -576,7 +578,7 @@ mod tests {
             (Address(8), Value::I32(30)),
         ];
 
-        let current_values = vec![15i32, 20, 25];
+        let current_values = [15i32, 20, 25];
 
         let refined = ScanEngine::refine_scan(
             &previous,

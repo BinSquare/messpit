@@ -122,7 +122,7 @@ impl EventSender for EngineTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use messpit_protocol::{EngineCommand, EngineEvent, Pid};
+    use messpit_protocol::{EngineCommand, EngineEvent};
 
     #[test]
     fn roundtrip_command_event() {

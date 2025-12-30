@@ -103,17 +103,19 @@ impl Pattern {
         }
 
         // Quick check with first fixed byte
-        if let Some((idx, val)) = self.first_fixed
-            && data[offset + idx] != val {
+        if let Some((idx, val)) = self.first_fixed {
+            if data[offset + idx] != val {
                 return false;
             }
+        }
 
         // Full pattern check
         for (i, pattern_byte) in self.bytes.iter().enumerate() {
-            if let Some(expected) = pattern_byte
-                && data[offset + i] != *expected {
+            if let Some(expected) = pattern_byte {
+                if data[offset + i] != *expected {
                     return false;
                 }
+            }
         }
 
         true

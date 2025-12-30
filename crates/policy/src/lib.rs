@@ -246,22 +246,22 @@ mod tests {
         let policy = Policy::default();
 
         // PID 0 should be denied
-        match policy.check_attach(Pid(0)) {
-            PolicyDecision::Deny(_) => {}
-            PolicyDecision::Allow => panic!("Should deny PID 0"),
-        }
+        assert!(
+            matches!(policy.check_attach(Pid(0)), PolicyDecision::Deny(_)),
+            "Should deny PID 0"
+        );
 
         // PID 1 should be denied
-        match policy.check_attach(Pid(1)) {
-            PolicyDecision::Deny(_) => {}
-            PolicyDecision::Allow => panic!("Should deny PID 1"),
-        }
+        assert!(
+            matches!(policy.check_attach(Pid(1)), PolicyDecision::Deny(_)),
+            "Should deny PID 1"
+        );
 
         // Regular PID should be allowed
-        match policy.check_attach(Pid(12345)) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny(r) => panic!("Should allow regular PID: {}", r.message),
-        }
+        assert!(
+            matches!(policy.check_attach(Pid(12345)), PolicyDecision::Allow),
+            "Should allow regular PID"
+        );
     }
 
     #[test]
@@ -269,15 +269,15 @@ mod tests {
         let policy = Policy::default();
 
         // System process should be denied
-        match policy.check_attach_by_name("launchd") {
-            PolicyDecision::Deny(_) => {}
-            PolicyDecision::Allow => panic!("Should deny launchd"),
-        }
+        assert!(
+            matches!(policy.check_attach_by_name("launchd"), PolicyDecision::Deny(_)),
+            "Should deny launchd"
+        );
 
         // Game should be allowed
-        match policy.check_attach_by_name("game.exe") {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny(r) => panic!("Should allow game.exe: {}", r.message),
-        }
+        assert!(
+            matches!(policy.check_attach_by_name("game.exe"), PolicyDecision::Allow),
+            "Should allow game.exe"
+        );
     }
 }

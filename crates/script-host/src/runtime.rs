@@ -237,8 +237,9 @@ where
 
     result?;
 
+    let output_str = output.borrow().clone();
     Ok(ScriptResult {
-        output: output.borrow().clone(),
+        output: output_str,
         return_value,
     })
 }
