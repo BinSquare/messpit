@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -60,9 +60,9 @@ impl LinuxProcess {
             .ok();
 
         if mem_file.is_none() {
-            // Check if we can at least read maps (to give a better error)
+            // Check if we can at least open maps (to give a better error)
             let maps_path = format!("/proc/{}/maps", pid.0);
-            if fs::read_to_string(&maps_path).is_err() {
+            if File::open(&maps_path).is_err() {
                 return Err(PlatformError::PermissionDenied(
                     "Cannot access process memory. Check ptrace_scope or run as root.".into(),
                 ));
@@ -446,9 +446,10 @@ fn is_process_attachable(pid: u32) -> bool {
         return false; // Can't read
     }
 
-    // Check if we can read the maps file (basic permission check)
+    // Check if we can open the maps file (basic permission check)
+    // Just open, don't read the entire file - that's expensive for large processes
     let maps_path = format!("/proc/{}/maps", pid);
-    fs::read_to_string(&maps_path).is_ok()
+    File::open(&maps_path).is_ok()
 }
 
 /// List all processes on the system

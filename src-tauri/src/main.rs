@@ -111,32 +111,33 @@ fn list_processes_cmd() -> Result<Vec<ProcessInfo>, String> {
 fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, String> {
     let pid = Pid(pid);
 
-    // Get process info first
-    let processes = list_processes().map_err(|e| {
-        error_process("list processes", &e.to_string())
-    })?;
-    let process_info = processes
-        .iter()
-        .find(|p| p.pid == pid)
-        .ok_or_else(|| error_validation("process", &format!(
-            "PID {} not found. The process may have exited.", pid.0
-        )))?;
+    // Clear previous session state (watches, freezes, scan results)
+    {
+        let mut session = state.session.write_or_recover();
+        session.watches.clear();
+        session.freezes.clear();
+    }
+    *state.last_scan_results.lock_or_recover() = Vec::new();
+    *state.last_scan_type.lock_or_recover() = None;
 
-    // Attach via platform API
+    // Attach via platform API - this also gets process name efficiently
     let handle = attach(pid).map_err(|e: PlatformError| {
         error_process("attach to process", &e.to_string())
     })?;
 
+    // Get process name from the handle (already fetched during attach)
+    let name = handle.fingerprint().process_name;
+
     let result = AttachResult {
         pid: pid.0,
-        name: process_info.name.clone(),
+        name: name.clone(),
         arch: "x86_64".into(),
     };
 
     // Store attached process with handle
     let attached = AttachedProcess {
         pid,
-        name: process_info.name.clone(),
+        name,
         handle,
     };
 
@@ -182,27 +183,38 @@ fn get_attached(state: State<'_, AppState>) -> Option<AttachResult> {
     })
 }
 
-/// Get memory regions of the attached process
+/// Paginated region response
+#[derive(serde::Serialize)]
+struct RegionsResponse {
+    regions: Vec<RegionInfo>,
+    total: usize,
+    page: usize,
+    per_page: usize,
+}
+
+/// Get memory regions of the attached process (paginated)
 #[tauri::command]
-fn get_regions(state: State<'_, AppState>) -> Result<Vec<RegionInfo>, String> {
+fn get_regions(
+    page: Option<usize>,
+    per_page: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<RegionsResponse, String> {
     let guard = state.attached.lock_checked()?;
     let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
 
     let regions = attached.handle.regions().map_err(|e| e.to_string())?;
+    let total = regions.len();
 
-    Ok(regions
+    // Default: 500 regions per page, page 0
+    let per_page = per_page.unwrap_or(500);
+    let page = page.unwrap_or(0);
+    let skip = page * per_page;
+
+    let page_regions: Vec<RegionInfo> = regions
         .into_iter()
+        .skip(skip)
+        .take(per_page)
         .map(|r| {
-            // Try to read first 16 bytes for preview if readable
-            let preview = if r.permissions.read {
-                let mut buf = [0u8; 16];
-                attached.handle.read_memory(r.base, &mut buf).ok().map(|_| {
-                    buf.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
-                })
-            } else {
-                None
-            };
-
             RegionInfo {
                 start: format!("0x{:016X}", r.base.0),
                 end: format!("0x{:016X}", r.base.0.saturating_add(r.size)),
@@ -211,10 +223,40 @@ fn get_regions(state: State<'_, AppState>) -> Result<Vec<RegionInfo>, String> {
                 writable: r.permissions.write,
                 executable: r.permissions.execute,
                 module: r.module,
-                preview,
+                preview: None, // Previews loaded on-demand via get_region_preview
             }
         })
-        .collect())
+        .collect();
+
+    Ok(RegionsResponse {
+        regions: page_regions,
+        total,
+        page,
+        per_page,
+    })
+}
+
+/// Get preview bytes for a specific memory region (on-demand loading)
+#[tauri::command]
+fn get_region_preview(address: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let guard = state.attached.lock_checked()?;
+    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+
+    // Parse address (strip 0x prefix if present)
+    let addr_str = address.trim_start_matches("0x").trim_start_matches("0X");
+    let addr = u64::from_str_radix(addr_str, 16)
+        .map_err(|e| format!("Invalid address '{}': {}", address, e))?;
+
+    let mut buf = [0u8; 16];
+    match attached.handle.read_memory(Address(addr), &mut buf) {
+        Ok(_) => Ok(Some(
+            buf.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Perform a memory scan
@@ -1931,6 +1973,7 @@ fn main() {
             detach_process,
             get_attached,
             get_regions,
+            get_region_preview,
             start_scan,
             get_scan_count,
             refine_scan,

@@ -26,6 +26,13 @@
     preview: string | null;
   }
 
+  interface RegionsResponse {
+    regions: RegionInfo[];
+    total: number;
+    page: number;
+    per_page: number;
+  }
+
   interface ScanResult {
     address: string;
     value: string;
@@ -82,6 +89,8 @@
   let showOnlyAttachable = $state(true);  // Default to showing only attachable processes
   let attachedProcess: AttachResult | null = $state(null);
   let selectedPid: number | null = $state(null);
+  let processDisplayLimit = $state(50);  // Limit displayed processes for performance
+  const PROCESS_DISPLAY_INCREMENT = 50;
 
   // Tabs
   let activeTab = $state<"scan" | "watch" | "regions" | "patterns" | "audit">("scan");
@@ -106,11 +115,17 @@
 
   // Regions
   let regions: RegionInfo[] = $state([]);
+  let totalRegions = $state(0);
   let loadingRegions = $state(false);
   let regionSortBy = $state<"address" | "size" | "module" | "perms">("address");
   let regionSortAsc = $state(true);
   let regionShowAll = $state(false);
   let regionModuleFilter = $state("");
+  let regionPage = $state(0);
+  const REGIONS_PER_PAGE = 100;
+  // Lazy-loaded previews: address -> preview string (or "loading" / "error")
+  let previewCache: Map<string, string> = $state(new Map());
+  let loadingPreviews: Set<string> = $state(new Set());
 
   // Memory Viewer
   let memoryViewerOpen = $state(false);
@@ -303,9 +318,20 @@
   async function attachToProcess(pid: number) {
     error = null;
     try {
+      // Stop polling and clear state from previous process
+      stopWatchPolling();
+      watches = [];
+      regions = [];
+      totalRegions = 0;
+      scanResults = [];
+      totalScanResults = 0;
+      hasPreviousScan = false;
+      previewCache = new Map();
+
       attachedProcess = await invoke<AttachResult>("attach_process", { pid });
       selectedPid = pid;
-      loadRegions();
+      // Don't load regions immediately - load lazily when user switches to Regions tab
+      // This prevents UI freeze for processes with many regions (like containerd/dockerd)
       startWatchPolling();
       showToast(`Attached to ${attachedProcess.name}`, "success");
     } catch (e) {
@@ -330,15 +356,51 @@
     }
   }
 
-  async function loadRegions() {
+  async function loadRegions(page: number = 0, refresh: boolean = true) {
+    // Skip if no process attached
+    if (!attachedProcess) {
+      return;
+    }
+
     loadingRegions = true;
     error = null;
+    // Clear preview cache when refreshing
+    if (refresh) {
+      previewCache = new Map();
+      loadingPreviews = new Set();
+      regionPage = 0;
+    }
     try {
-      regions = await invoke<RegionInfo[]>("get_regions");
+      const response = await invoke<RegionsResponse>("get_regions", {
+        page,
+        perPage: REGIONS_PER_PAGE,
+      });
+      regions = response.regions;
+      totalRegions = response.total;
+      regionPage = response.page;
     } catch (e) {
       error = String(e);
     } finally {
       loadingRegions = false;
+    }
+  }
+
+  async function loadRegionPreview(address: string) {
+    // Skip if already cached or loading
+    if (previewCache.has(address) || loadingPreviews.has(address)) {
+      return;
+    }
+
+    loadingPreviews = new Set([...loadingPreviews, address]);
+    try {
+      const preview = await invoke<string | null>("get_region_preview", { address });
+      previewCache = new Map([...previewCache, [address, preview ?? "-"]]);
+    } catch {
+      previewCache = new Map([...previewCache, [address, "error"]]);
+    } finally {
+      const newSet = new Set(loadingPreviews);
+      newSet.delete(address);
+      loadingPreviews = newSet;
     }
   }
 
@@ -414,7 +476,22 @@
     }
   }
 
-  async function loadWatches() {
+  async function loadWatches(force: boolean = false) {
+    // Prevent overlapping polls - if already loading, skip this poll
+    if (loadingWatches) {
+      return;
+    }
+
+    // Skip polling if no attached process (unless forced)
+    if (!attachedProcess && !force) {
+      return;
+    }
+
+    // Skip polling if no watches exist and not forced (no point reading empty list repeatedly)
+    if (watches.length === 0 && !force) {
+      return;
+    }
+
     loadingWatches = true;
     try {
       const newWatches = await invoke<WatchInfo[]>("get_watches");
@@ -434,6 +511,15 @@
       }
 
       watches = newWatches;
+
+      // Start polling if we have watches and polling isn't running
+      if (watches.length > 0 && watchPollInterval === null) {
+        watchPollInterval = setInterval(loadWatches, 1000) as unknown as number;
+      }
+      // Stop polling if no watches
+      if (watches.length === 0 && watchPollInterval !== null) {
+        stopWatchPolling();
+      }
     } catch (e) {
       // Silently handle watch load errors during polling
     } finally {
@@ -512,10 +598,14 @@
     }
   }
 
-  function startWatchPolling() {
+  async function startWatchPolling() {
     stopWatchPolling();
-    loadWatches();
-    watchPollInterval = setInterval(loadWatches, 500) as unknown as number;
+    await loadWatches(true);  // Force initial load to check for existing watches
+    // Only start polling if there are watches - otherwise no need to poll
+    // Polling will be started when a watch is added
+    if (watches.length > 0) {
+      watchPollInterval = setInterval(loadWatches, 1000) as unknown as number;
+    }
   }
 
   function stopWatchPolling() {
@@ -1104,7 +1194,7 @@
     error = null;
   }
 
-  const filteredProcesses = $derived(
+  const allFilteredProcesses = $derived(
     processes.filter((p) => {
       // Apply text filter
       const matchesText = p.name.toLowerCase().includes(filter.toLowerCase()) ||
@@ -1124,11 +1214,23 @@
     })
   );
 
+  // Limit displayed processes for performance
+  const filteredProcesses = $derived(
+    allFilteredProcesses.slice(0, processDisplayLimit)
+  );
+
+  // Reset process display limit when filter changes
+  $effect(() => {
+    filter;
+    showOnlyAttachable;
+    processDisplayLimit = 50;
+  });
+
   const writableRegions = $derived(
     regions.filter(r => r.writable && r.readable)
   );
 
-  // Sorted and filtered regions
+  // Sorted and filtered regions (full list)
   const filteredRegions = $derived(() => {
     let result = regionShowAll ? regions : regions.filter(r => r.writable);
 
@@ -1162,6 +1264,9 @@
     return result;
   });
 
+  // Total pages based on backend total (before frontend filtering)
+  const regionTotalPages = $derived(Math.ceil(totalRegions / REGIONS_PER_PAGE));
+
   function toggleRegionSort(field: "address" | "size" | "module" | "perms") {
     if (regionSortBy === field) {
       regionSortAsc = !regionSortAsc;
@@ -1173,7 +1278,7 @@
 
   function copyToClipboard(text: string) {
     navigator.clipboard.writeText(text);
-    addToast("Copied to clipboard", "success");
+    showToast("Copied to clipboard", "success");
   }
 
   // Memory Viewer
@@ -1523,10 +1628,21 @@
           {/if}
         </div>
       {/each}
+      {#if allFilteredProcesses.length > processDisplayLimit}
+        <button
+          class="show-more-btn"
+          onclick={() => processDisplayLimit += PROCESS_DISPLAY_INCREMENT}
+          type="button"
+        >
+          Show more ({allFilteredProcesses.length - processDisplayLimit} remaining)
+        </button>
+      {/if}
     </div>
 
     <div class="sidebar-footer">
-      <span class="process-count">{filteredProcesses.length} of {processes.length}</span>
+      <span class="process-count">
+        {filteredProcesses.length}{allFilteredProcesses.length > processDisplayLimit ? `/${allFilteredProcesses.length}` : ""} of {processes.length}
+      </span>
     </div>
   </aside>
 
@@ -2396,8 +2512,16 @@
                               {/if}
                             </td>
                             <td class="col-preview">
-                              {#if region.preview}
-                                <span class="mono preview-text">{region.preview}</span>
+                              {#if previewCache.has(region.start)}
+                                <span class="mono preview-text">{previewCache.get(region.start)}</span>
+                              {:else if loadingPreviews.has(region.start)}
+                                <span class="preview-loading">...</span>
+                              {:else if region.readable}
+                                <button
+                                  class="btn-load-preview"
+                                  onclick={() => loadRegionPreview(region.start)}
+                                  title="Load 16-byte preview"
+                                >Load</button>
                               {:else}
                                 <span class="no-preview">-</span>
                               {/if}
@@ -2415,6 +2539,40 @@
                         {/each}
                       </tbody>
                     </table>
+                    {#if regionTotalPages > 1}
+                      <div class="pagination">
+                        <button
+                          class="pagination-btn"
+                          onclick={() => loadRegions(0, false)}
+                          disabled={regionPage === 0 || loadingRegions}
+                          title="First page"
+                        >««</button>
+                        <button
+                          class="pagination-btn"
+                          onclick={() => loadRegions(Math.max(0, regionPage - 1), false)}
+                          disabled={regionPage === 0 || loadingRegions}
+                          title="Previous page"
+                        >«</button>
+                        <span class="pagination-info">
+                          Page {regionPage + 1} of {regionTotalPages}
+                          <span class="pagination-range">
+                            (showing {filteredRegions().length} of {totalRegions} total)
+                          </span>
+                        </span>
+                        <button
+                          class="pagination-btn"
+                          onclick={() => loadRegions(Math.min(regionTotalPages - 1, regionPage + 1), false)}
+                          disabled={regionPage >= regionTotalPages - 1 || loadingRegions}
+                          title="Next page"
+                        >»</button>
+                        <button
+                          class="pagination-btn"
+                          onclick={() => loadRegions(regionTotalPages - 1, false)}
+                          disabled={regionPage >= regionTotalPages - 1 || loadingRegions}
+                          title="Last page"
+                        >»»</button>
+                      </div>
+                    {/if}
                   {:else if regions.length > 0}
                     <div class="empty-results">
                       <p>No regions match filters</p>
@@ -3474,6 +3632,22 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     animation: spin 0.8s linear infinite;
   }
 
+  .show-more-btn {
+    width: 100%;
+    padding: 8px 16px;
+    background: var(--surface);
+    border: none;
+    border-top: 1px solid var(--separator);
+    color: var(--primary);
+    font-size: 12px;
+    cursor: pointer;
+    text-align: center;
+  }
+
+  .show-more-btn:hover {
+    background: var(--hover);
+  }
+
   .sidebar-footer {
     padding: 12px 16px;
     border-top: 1px solid var(--separator);
@@ -4113,6 +4287,53 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     max-width: 200px;
   }
 
+  /* Pagination */
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--separator);
+  }
+
+  .pagination-btn {
+    min-width: 32px;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+
+  .pagination-btn:hover:not(:disabled) {
+    background: var(--bg-tertiary);
+    border-color: var(--accent);
+  }
+
+  .pagination-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .pagination-info {
+    font-size: 13px;
+    color: var(--text-secondary);
+    padding: 0 12px;
+  }
+
+  .pagination-range {
+    color: var(--text-tertiary);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
   .addr-btn {
     background: none;
     border: none;
@@ -4182,6 +4403,28 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .btn-load-preview {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 2px 6px;
+    font-size: 10px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+
+  .btn-load-preview:hover {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+  }
+
+  .preview-loading {
+    color: var(--text-secondary);
+    font-size: 10px;
+    opacity: 0.7;
   }
 
   .empty-results, .loading-state {
