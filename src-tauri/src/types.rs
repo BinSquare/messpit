@@ -19,12 +19,25 @@ pub struct ProcessInfo {
 
 /// Request to filter process list server-side
 #[derive(Deserialize)]
+#[serde(default)]
 pub struct ProcessListRequest {
     pub filter: Option<String>,
     pub show_only_attachable: bool,
     pub pinned_pids: Vec<u32>,
     pub limit: Option<usize>,
     pub include_paths: bool,
+}
+
+impl Default for ProcessListRequest {
+    fn default() -> Self {
+        Self {
+            filter: None,
+            show_only_attachable: true, // Default to showing only attachable processes
+            pinned_pids: Vec::new(),
+            limit: None,
+            include_paths: false,
+        }
+    }
 }
 
 /// Process list response with total count
