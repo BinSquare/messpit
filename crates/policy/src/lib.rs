@@ -1,6 +1,6 @@
 //! Messpit Policy Engine
 //!
-//! Provides policy gating for operations and audit logging.
+//! Provides policy gating for operations.
 //!
 //! Default posture: offline-first, deny risky targets by default.
 
@@ -174,67 +174,6 @@ fn default_deny_list() -> Vec<String> {
         // Our own process
         "messpit".into(),
     ]
-}
-
-/// Audit log for recording operations
-pub struct AuditLog {
-    entries: Vec<AuditEntry>,
-    max_entries: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AuditEntry {
-    pub timestamp: String,
-    pub operation: String,
-    pub target_pid: Option<u32>,
-    pub address: Option<u64>,
-    pub details: Option<String>,
-    pub allowed: bool,
-}
-
-impl AuditLog {
-    pub fn new(max_entries: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            max_entries,
-        }
-    }
-
-    pub fn record(&mut self, entry: AuditEntry) {
-        tracing::debug!(
-            operation = %entry.operation,
-            pid = ?entry.target_pid,
-            addr = ?entry.address.map(|a| format!("0x{:X}", a)),
-            allowed = entry.allowed,
-            "Audit"
-        );
-
-        self.entries.push(entry);
-
-        // Rotate if needed
-        if self.entries.len() > self.max_entries {
-            self.entries.remove(0);
-        }
-    }
-
-    pub fn entries(&self) -> &[AuditEntry] {
-        &self.entries
-    }
-
-    /// Export to JSON lines format
-    pub fn export_jsonl(&self) -> String {
-        self.entries
-            .iter()
-            .filter_map(|e| serde_json::to_string(e).ok())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-impl Default for AuditLog {
-    fn default() -> Self {
-        Self::new(10000)
-    }
 }
 
 #[cfg(test)]

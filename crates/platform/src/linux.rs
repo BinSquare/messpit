@@ -453,7 +453,7 @@ fn is_process_attachable(pid: u32) -> bool {
 }
 
 /// List all processes on the system
-pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
+pub fn list_processes(check_attachable: bool, include_path: bool) -> Result<Vec<ProcessInfo>, PlatformError> {
     let mut processes = Vec::new();
 
     // Read /proc directory
@@ -483,13 +483,21 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
             .or_else(|| read_proc_cmdline(pid))
             .unwrap_or_else(|| format!("pid_{}", pid));
 
-        // Get executable path
-        let path = fs::read_link(format!("/proc/{}/exe", pid))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        // Get executable path (optional)
+        let path = if include_path {
+            fs::read_link(format!("/proc/{}/exe", pid))
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
 
         // Check if attachable
-        let attachable = is_process_attachable(pid);
+        let attachable = if check_attachable {
+            is_process_attachable(pid)
+        } else {
+            true
+        };
 
         processes.push(ProcessInfo {
             pid: Pid(pid),

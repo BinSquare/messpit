@@ -3,7 +3,7 @@ name = "messpit-policy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Policy engine for gating operations and audit logging"
+description = "Policy engine for gating operations"
 
 [dependencies]
 messpit-protocol = { path = "../protocol" }

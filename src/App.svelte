@@ -9,6 +9,11 @@
     attachable: boolean;
   }
 
+  interface ProcessListResponse {
+    processes: ProcessInfo[];
+    total: number;
+  }
+
   interface AttachResult {
     pid: number;
     name: string;
@@ -23,7 +28,6 @@
     writable: boolean;
     executable: boolean;
     module: string | null;
-    preview: string | null;
   }
 
   interface RegionsResponse {
@@ -82,29 +86,39 @@
   }
 
   // State
-  let processes: ProcessInfo[] = $state([]);
+  let processes: ProcessInfo[] = $state.raw([]);
   let loading = $state(false);
   let error: string | null = $state(null);
   let filter = $state("");
-  let showOnlyAttachable = $state(true);  // Default to showing only attachable processes
+  let showOnlyAttachable = $state(false);  // Default to showing all processes
   let attachedProcess: AttachResult | null = $state(null);
+
+  // Filtered processes based on search and attachable filter
+  const filteredProcesses = $derived.by(() => {
+    let result = processes;
+
+    // Filter by attachable
+    if (showOnlyAttachable) {
+      result = result.filter(p => p.attachable);
+    }
+
+    // Filter by search text
+    if (filter.trim()) {
+      const searchLower = filter.toLowerCase();
+      result = result.filter(p =>
+        p.name.toLowerCase().includes(searchLower) ||
+        p.pid.toString().includes(filter)
+      );
+    }
+
+    return result;
+  });
   let selectedPid: number | null = $state(null);
   let processDisplayLimit = $state(50);  // Limit displayed processes for performance
   const PROCESS_DISPLAY_INCREMENT = 50;
 
   // Tabs
-  let activeTab = $state<"scan" | "watch" | "regions" | "patterns" | "audit">("scan");
-
-  // Audit log
-  interface AuditEntry {
-    timestamp: string;
-    operation: string;
-    pid: number | null;
-    address: string | null;
-    details: string | null;
-  }
-  let auditLogs: AuditEntry[] = $state([]);
-  let loadingAudit = $state(false);
+  let activeTab = $state<"scan" | "watch" | "regions" | "patterns">("scan");
 
   // Console panel
   let consoleOpen = $state(false);
@@ -114,7 +128,7 @@
   let showScriptHelp = $state(false);
 
   // Regions
-  let regions: RegionInfo[] = $state([]);
+  let regions: RegionInfo[] = $state.raw([]);
   let totalRegions = $state(0);
   let loadingRegions = $state(false);
   let regionSortBy = $state<"address" | "size" | "module" | "perms">("address");
@@ -123,9 +137,6 @@
   let regionModuleFilter = $state("");
   let regionPage = $state(0);
   const REGIONS_PER_PAGE = 100;
-  // Lazy-loaded previews: address -> preview string (or "loading" / "error")
-  let previewCache: Map<string, string> = $state(new Map());
-  let loadingPreviews: Set<string> = $state(new Set());
 
   // Memory Viewer
   let memoryViewerOpen = $state(false);
@@ -144,7 +155,7 @@
   let effectiveValueType = $derived(
     scanValueType === "string" ? `string[${stringMaxLen}]` : scanValueType
   );
-  let scanResults: ScanResult[] = $state([]);
+  let scanResults: ScanResult[] = $state.raw([]);
   let scanning = $state(false);
   let totalScanResults = $state(0);
   let hasPreviousScan = $state(false);
@@ -227,7 +238,7 @@
   const initialTab = createNewTab();
   let scriptTabs: ScriptTab[] = $state([initialTab]);
   let activeTabId: string = $state(initialTab.id);
-  let savedScripts: SavedScript[] = $state([]);
+  let savedScripts: SavedScript[] = $state.raw([]);
   let showScriptMenu = $state(false);
   let editingTabName: string | null = $state(null);
   let editingTabNameValue = $state("");
@@ -274,19 +285,21 @@
     }, 3000);
   }
 
-  // Pinned processes
-  let pinnedPids: number[] = $state([]);
+  // Pinned processes - use Set for O(1) lookups
+  let pinnedPids: Set<number> = $state(new Set());
 
   function togglePinProcess(pid: number) {
-    if (pinnedPids.includes(pid)) {
-      pinnedPids = pinnedPids.filter(p => p !== pid);
+    const newPinned = new Set(pinnedPids);
+    if (newPinned.has(pid)) {
+      newPinned.delete(pid);
       showToast("Process unpinned", "info");
     } else {
-      pinnedPids = [...pinnedPids, pid];
+      newPinned.add(pid);
       showToast("Process pinned", "success");
     }
+    pinnedPids = newPinned;
     // Save to localStorage
-    localStorage.setItem("messpit_pinned", JSON.stringify(pinnedPids));
+    localStorage.setItem("messpit_pinned", JSON.stringify([...pinnedPids]));
   }
 
   // Load pinned processes from localStorage
@@ -294,7 +307,7 @@
     try {
       const saved = localStorage.getItem("messpit_pinned");
       if (saved) {
-        pinnedPids = JSON.parse(saved);
+        pinnedPids = new Set(JSON.parse(saved));
       }
     } catch {}
   }
@@ -326,7 +339,6 @@
       scanResults = [];
       totalScanResults = 0;
       hasPreviousScan = false;
-      previewCache = new Map();
 
       attachedProcess = await invoke<AttachResult>("attach_process", { pid });
       selectedPid = pid;
@@ -364,10 +376,7 @@
 
     loadingRegions = true;
     error = null;
-    // Clear preview cache when refreshing
     if (refresh) {
-      previewCache = new Map();
-      loadingPreviews = new Set();
       regionPage = 0;
     }
     try {
@@ -382,25 +391,6 @@
       error = String(e);
     } finally {
       loadingRegions = false;
-    }
-  }
-
-  async function loadRegionPreview(address: string) {
-    // Skip if already cached or loading
-    if (previewCache.has(address) || loadingPreviews.has(address)) {
-      return;
-    }
-
-    loadingPreviews = new Set([...loadingPreviews, address]);
-    try {
-      const preview = await invoke<string | null>("get_region_preview", { address });
-      previewCache = new Map([...previewCache, [address, preview ?? "-"]]);
-    } catch {
-      previewCache = new Map([...previewCache, [address, "error"]]);
-    } finally {
-      const newSet = new Set(loadingPreviews);
-      newSet.delete(address);
-      loadingPreviews = newSet;
     }
   }
 
@@ -527,37 +517,6 @@
     }
   }
 
-  // Audit log functions
-  async function loadAuditLog() {
-    loadingAudit = true;
-    try {
-      auditLogs = await invoke<AuditEntry[]>("get_audit_log");
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loadingAudit = false;
-    }
-  }
-
-  async function clearAuditLog() {
-    try {
-      await invoke("clear_audit_log");
-      auditLogs = [];
-      showToast("Audit log cleared", "info");
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  function formatAuditTimestamp(timestamp: string): string {
-    try {
-      const date = new Date(timestamp);
-      return date.toLocaleString();
-    } catch {
-      return timestamp;
-    }
-  }
-
   function formatProcessPath(path: string | null): string {
     if (!path) return "";
     // Get the parent directory for context
@@ -601,11 +560,7 @@
   async function startWatchPolling() {
     stopWatchPolling();
     await loadWatches(true);  // Force initial load to check for existing watches
-    // Only start polling if there are watches - otherwise no need to poll
-    // Polling will be started when a watch is added
-    if (watches.length > 0) {
-      watchPollInterval = setInterval(loadWatches, 1000) as unknown as number;
-    }
+    // Polling is started by loadWatches when watches exist.
   }
 
   function stopWatchPolling() {
@@ -1194,54 +1149,32 @@
     error = null;
   }
 
-  const allFilteredProcesses = $derived(
-    processes.filter((p) => {
-      // Apply text filter
-      const matchesText = p.name.toLowerCase().includes(filter.toLowerCase()) ||
-        p.pid.toString().includes(filter);
-
-      // Apply attachable filter
-      const matchesAttachable = !showOnlyAttachable || p.attachable === true;
-
-      return matchesText && matchesAttachable;
-    }).sort((a, b) => {
-      // Sort pinned processes first
-      const aPinned = pinnedPids.includes(a.pid);
-      const bPinned = pinnedPids.includes(b.pid);
-      if (aPinned && !bPinned) return -1;
-      if (!aPinned && bPinned) return 1;
-      return 0;
-    })
-  );
-
-  // Limit displayed processes for performance
-  const filteredProcesses = $derived(
-    allFilteredProcesses.slice(0, processDisplayLimit)
-  );
-
-  // Reset process display limit when filter changes
+  // ORIGINAL: Simple init effect - load everything on startup
   $effect(() => {
-    filter;
-    showOnlyAttachable;
-    processDisplayLimit = 50;
+    loadPinnedProcesses();
+    loadProcesses();
+    loadProjectInfo();
+    return () => stopWatchPolling();
   });
 
   const writableRegions = $derived(
     regions.filter(r => r.writable && r.readable)
   );
 
-  // Sorted and filtered regions (full list)
-  const filteredRegions = $derived(() => {
+  // Cache lowercase module filter for efficiency
+  const regionModuleFilterLower = $derived(regionModuleFilter.toLowerCase());
+
+  // Sorted and filtered regions (full list) - computed once, cached
+  const filteredRegions = $derived.by(() => {
     let result = regionShowAll ? regions : regions.filter(r => r.writable);
 
     // Filter by module name
     if (regionModuleFilter.trim()) {
-      const filter = regionModuleFilter.toLowerCase();
-      result = result.filter(r => r.module?.toLowerCase().includes(filter));
+      result = result.filter(r => r.module?.toLowerCase().includes(regionModuleFilterLower));
     }
 
     // Sort
-    result = [...result].sort((a, b) => {
+    return [...result].sort((a, b) => {
       let cmp = 0;
       switch (regionSortBy) {
         case "address":
@@ -1260,8 +1193,6 @@
       }
       return regionSortAsc ? cmp : -cmp;
     });
-
-    return result;
   });
 
   // Total pages based on backend total (before frontend filtering)
@@ -1486,12 +1417,7 @@
     }
   });
 
-  $effect(() => {
-    loadPinnedProcesses();
-    loadProcesses();
-    loadProjectInfo();
-    return () => stopWatchPolling();
-  });
+  // onMount removed - using $effect instead like original
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -1584,7 +1510,7 @@
 
     <div class="process-list">
       {#each filteredProcesses as proc (proc.pid)}
-        <div class="process-item-wrapper" class:pinned={pinnedPids.includes(proc.pid)}>
+        <div class="process-item-wrapper" class:pinned={pinnedPids.has(proc.pid)}>
           <button
             class="process-item"
             class:selected={selectedPid === proc.pid}
@@ -1608,9 +1534,9 @@
           </button>
           <button
             class="pin-btn"
-            class:pinned={pinnedPids.includes(proc.pid)}
+            class:pinned={pinnedPids.has(proc.pid)}
             onclick={(e) => { e.stopPropagation(); togglePinProcess(proc.pid); }}
-            title={pinnedPids.includes(proc.pid) ? "Unpin process" : "Pin process"}
+            title={pinnedPids.has(proc.pid) ? "Unpin process" : "Pin process"}
             type="button"
           >
             <svg viewBox="0 0 20 20" fill="currentColor">
@@ -1628,20 +1554,11 @@
           {/if}
         </div>
       {/each}
-      {#if allFilteredProcesses.length > processDisplayLimit}
-        <button
-          class="show-more-btn"
-          onclick={() => processDisplayLimit += PROCESS_DISPLAY_INCREMENT}
-          type="button"
-        >
-          Show more ({allFilteredProcesses.length - processDisplayLimit} remaining)
-        </button>
-      {/if}
     </div>
 
     <div class="sidebar-footer">
       <span class="process-count">
-        {filteredProcesses.length}{allFilteredProcesses.length > processDisplayLimit ? `/${allFilteredProcesses.length}` : ""} of {processes.length}
+        {filteredProcesses.length} of {processes.length} processes
       </span>
     </div>
   </aside>
@@ -1743,21 +1660,6 @@
           Patterns
           {#if signatures.length > 0}
             <span class="badge">{signatures.length}</span>
-          {/if}
-        </button>
-        <button
-          class="tab-item"
-          class:active={activeTab === "audit"}
-          onclick={() => { activeTab = "audit"; loadAuditLog(); }}
-          type="button"
-          title="View audit log of all operations"
-        >
-          <svg viewBox="0 0 20 20" fill="currentColor">
-            <path fill-rule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clip-rule="evenodd" />
-          </svg>
-          Audit
-          {#if auditLogs.length > 0}
-            <span class="badge">{auditLogs.length}</span>
           {/if}
         </button>
         <!-- Console toggle on the right side of tab bar -->
@@ -2427,7 +2329,7 @@
               <div class="card flex-1">
                 <div class="card-header">
                   <h3>Memory Regions</h3>
-                  <span class="results-count">{filteredRegions().length} shown / {regions.length} total</span>
+                  <span class="results-count">{filteredRegions.length} shown / {regions.length} total</span>
                 </div>
 
                 <!-- Regions Toolbar -->
@@ -2456,7 +2358,7 @@
                       <div class="loading-spinner"></div>
                       <span>Loading regions...</span>
                     </div>
-                  {:else if filteredRegions().length > 0}
+                  {:else if filteredRegions.length > 0}
                     <table class="regions-table">
                       <thead>
                         <tr>
@@ -2473,12 +2375,11 @@
                           <th class="col-module sortable" class:sorted={regionSortBy === "module"} onclick={() => toggleRegionSort("module")}>
                             Module {regionSortBy === "module" ? (regionSortAsc ? "↑" : "↓") : ""}
                           </th>
-                          <th class="col-preview">Preview</th>
                           <th class="col-actions"></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {#each filteredRegions() as region (region.start)}
+                        {#each filteredRegions as region (region.start)}
                           <tr class:non-writable={!region.writable}>
                             <td class="col-addr">
                               <button
@@ -2511,21 +2412,6 @@
                                 <span class="no-module">-</span>
                               {/if}
                             </td>
-                            <td class="col-preview">
-                              {#if previewCache.has(region.start)}
-                                <span class="mono preview-text">{previewCache.get(region.start)}</span>
-                              {:else if loadingPreviews.has(region.start)}
-                                <span class="preview-loading">...</span>
-                              {:else if region.readable}
-                                <button
-                                  class="btn-load-preview"
-                                  onclick={() => loadRegionPreview(region.start)}
-                                  title="Load 16-byte preview"
-                                >Load</button>
-                              {:else}
-                                <span class="no-preview">-</span>
-                              {/if}
-                            </td>
                             <td class="col-actions">
                               {#if region.readable}
                                 <button
@@ -2556,7 +2442,7 @@
                         <span class="pagination-info">
                           Page {regionPage + 1} of {regionTotalPages}
                           <span class="pagination-range">
-                            (showing {filteredRegions().length} of {totalRegions} total)
+                            (showing {filteredRegions.length} of {totalRegions} total)
                           </span>
                         </span>
                         <button
@@ -2787,68 +2673,6 @@
                 {/if}
               </div>
             </div>
-          </div>
-        {:else if activeTab === "audit"}
-          <!-- Audit Log Tab -->
-          <div class="tab-content audit-tab">
-            <div class="section-header">
-              <h3>Audit Log</h3>
-              <div class="section-actions">
-                <button class="btn btn-secondary btn-sm" onclick={loadAuditLog} disabled={loadingAudit}>
-                  <svg viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
-                  </svg>
-                  Refresh
-                </button>
-                <button class="btn btn-secondary btn-sm" onclick={clearAuditLog} disabled={auditLogs.length === 0}>
-                  <svg viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
-                  </svg>
-                  Clear
-                </button>
-              </div>
-            </div>
-
-            {#if loadingAudit}
-              <div class="loading-spinner">Loading audit log...</div>
-            {:else if auditLogs.length > 0}
-              <div class="audit-log-container">
-                <table class="data-table audit-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Operation</th>
-                      <th>PID</th>
-                      <th>Address</th>
-                      <th>Details</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {#each auditLogs.slice().reverse() as entry}
-                      <tr class="audit-entry audit-{entry.operation.split('_')[0]}">
-                        <td class="timestamp">{formatAuditTimestamp(entry.timestamp)}</td>
-                        <td class="operation">
-                          <span class="operation-badge {entry.operation.includes('write') || entry.operation.includes('freeze') ? 'write' : entry.operation.includes('attach') ? 'attach' : 'read'}">
-                            {entry.operation}
-                          </span>
-                        </td>
-                        <td class="pid">{entry.pid ?? '-'}</td>
-                        <td class="address mono">{entry.address ?? '-'}</td>
-                        <td class="details">{entry.details ?? '-'}</td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-            {:else}
-              <div class="empty-results">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z" />
-                </svg>
-                <p>No audit entries yet</p>
-                <span>Operations like attach, write, freeze, and watch changes will be logged here</span>
-              </div>
-            {/if}
           </div>
         {/if}
       </div>
@@ -4283,10 +4107,6 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     max-width: 140px;
   }
 
-  .regions-table .col-preview {
-    max-width: 200px;
-  }
-
   /* Pagination */
   .pagination {
     display: flex;
@@ -4390,41 +4210,9 @@ for (let i = 0; i &lt; 10; i++) {'{'}
     color: white;
   }
 
-  .no-module, .no-preview {
+  .no-module {
     color: var(--text-secondary);
     opacity: 0.5;
-  }
-
-  .preview-text {
-    color: var(--text-secondary);
-    font-size: 10px;
-    letter-spacing: 0.3px;
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .btn-load-preview {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-    padding: 2px 6px;
-    font-size: 10px;
-    border-radius: 3px;
-    cursor: pointer;
-  }
-
-  .btn-load-preview:hover {
-    background: var(--primary);
-    color: white;
-    border-color: var(--primary);
-  }
-
-  .preview-loading {
-    color: var(--text-secondary);
-    font-size: 10px;
-    opacity: 0.7;
   }
 
   .empty-results, .loading-state {
@@ -5460,154 +5248,6 @@ for (let i = 0; i &lt; 10; i++) {'{'}
   .value-display.changed {
     color: var(--success);
     font-weight: 600;
-  }
-
-  /* Audit Log Styles */
-  .audit-tab {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    height: 100%;
-  }
-
-  .section-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 16px 20px;
-    background: var(--bg-secondary);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .section-header h3 {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0;
-  }
-
-  .section-actions {
-    display: flex;
-    gap: 8px;
-  }
-
-  .audit-log-container {
-    flex: 1;
-    background: var(--bg-secondary);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .data-table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  .data-table thead {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-  }
-
-  .data-table th {
-    background: var(--bg-secondary);
-    padding: 12px 16px;
-    text-align: left;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    border-bottom: 1px solid var(--separator);
-  }
-
-  .data-table td {
-    padding: 10px 16px;
-    font-size: 13px;
-    border-bottom: 1px solid var(--separator);
-    color: var(--text-primary);
-  }
-
-  .data-table tbody tr:hover td {
-    background: var(--bg-primary);
-  }
-
-  .audit-table {
-    display: block;
-    overflow-y: auto;
-    max-height: 100%;
-  }
-
-  .audit-table thead,
-  .audit-table tbody,
-  .audit-table tr {
-    display: table;
-    width: 100%;
-    table-layout: fixed;
-  }
-
-  .audit-table tbody {
-    display: block;
-    overflow-y: auto;
-    max-height: calc(100vh - 320px);
-  }
-
-  .audit-entry .timestamp {
-    width: 150px;
-    color: var(--text-secondary);
-    font-family: "SF Mono", "Menlo", monospace;
-    font-size: 12px;
-  }
-
-  .audit-entry .operation {
-    width: 140px;
-  }
-
-  .audit-entry .pid {
-    width: 80px;
-    text-align: center;
-  }
-
-  .audit-entry .address {
-    width: 160px;
-  }
-
-  .audit-entry .details {
-    flex: 1;
-    color: var(--text-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .operation-badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 4px 10px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-  }
-
-  .operation-badge.read {
-    background: #dbeafe;
-    color: #1d4ed8;
-  }
-
-  .operation-badge.write {
-    background: #fef3c7;
-    color: #92400e;
-  }
-
-  .operation-badge.attach {
-    background: #dcfce7;
-    color: #166534;
   }
 
   /* Script Tabs */

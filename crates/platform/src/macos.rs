@@ -760,7 +760,7 @@ fn is_process_attachable(pid: pid_t, path: &Option<String>, name: &str) -> bool 
 }
 
 /// List all processes on the system
-pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
+pub fn list_processes(check_attachable: bool, include_path: bool) -> Result<Vec<ProcessInfo>, PlatformError> {
     let mut processes = Vec::new();
 
     // First call to get count
@@ -790,8 +790,12 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
         }
 
         if let Some(name) = get_process_name(pid) {
-            let path = get_process_path(pid);
-            let attachable = is_process_attachable(pid, &path, &name);
+            let path = if include_path { get_process_path(pid) } else { None };
+            let attachable = if check_attachable {
+                is_process_attachable(pid, &path, &name)
+            } else {
+                true
+            };
             processes.push(ProcessInfo {
                 pid: Pid(pid as u32),
                 name,

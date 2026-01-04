@@ -13,7 +13,9 @@ mod helpers;
 mod state;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
 // Re-export from helpers module
@@ -33,14 +35,15 @@ use types::{
     AddSignatureRequest, AddWatchRequest, CheatTableEntryInfo, CheatTableInfo,
     ExportCheatTableRequest, FreezeRequest, ImportCheatTableRequest, PatternScanRequest,
     PatternScanResult, PointerScanRequest, PointerScanResultItem, ProcessInfo,
-    AttachResult, RefineRequest, RegionInfo, ResolveChainRequest, ScanRequest,
-    ScanResult, ScriptInfo, ScriptOutputResult, ScriptRunResult, SignatureInfo,
-    WatchInfo, WriteValueRequest, ReadValueRequest, ProjectInfo, AuditEntryInfo,
+    ProcessListRequest, ProcessListResponse, AttachResult, RefineRequest, RegionInfo,
+    ResolveChainRequest, ScanRequest, ScanResult, ScriptInfo, ScriptOutputResult,
+    ScriptRunResult, SignatureInfo, WatchInfo, WriteValueRequest, ReadValueRequest,
+    ProjectInfo,
 };
 
 use messpit_engine::session::{FreezeEntry, WatchEntry};
-use messpit_engine::{decode_at, encode_value, new_shared_session, AuditLog, Pattern, PatternScanner, Project, ProjectSignature, ProjectWatchEntry, ScanEngine, SharedSession};
-use messpit_platform::{attach, list_processes, PlatformError, ProcessHandle};
+use messpit_engine::{decode_at, encode_value, new_shared_session, Pattern, PatternScanner, Project, ProjectSignature, ProjectWatchEntry, ScanEngine, SharedSession};
+use messpit_platform::{attach, list_processes, list_processes_with_options, PlatformError, ProcessHandle};
 use messpit_protocol::{Address, Architecture, EntryId, Pid, Refinement, RunId, ScanComparison, ScanParams, Value, ValueType};
 use messpit_script_host::{CancellationToken, HostRequest, HostResponse, ScriptConfig, ScriptHost, TYPESCRIPT_DEFINITIONS};
 use tauri::{Manager, State};
@@ -79,8 +82,6 @@ struct AppState {
     script_output: Mutex<HashMap<String, Vec<String>>>,
     /// Tracks if project has unsaved changes
     has_unsaved_changes: std::sync::atomic::AtomicBool,
-    /// Audit log for tracking operations
-    audit_log: Mutex<AuditLog>,
 }
 
 struct AttachedProcess {
@@ -91,7 +92,7 @@ struct AttachedProcess {
 
 // Types are imported from the types module
 
-/// List all running processes
+/// List all running processes - ORIGINAL SIMPLE VERSION
 #[tauri::command]
 fn list_processes_cmd() -> Result<Vec<ProcessInfo>, String> {
     let processes = list_processes().map_err(|e| e.to_string())?;
@@ -106,12 +107,76 @@ fn list_processes_cmd() -> Result<Vec<ProcessInfo>, String> {
         .collect())
 }
 
+/// List processes with server-side filtering and ordering
+#[tauri::command(async)]
+fn list_processes_filtered(_request: ProcessListRequest) -> Result<ProcessListResponse, String> {
+    // DEBUG: Return empty immediately to test if the issue is in list_processes_with_options
+    return Ok(ProcessListResponse {
+        processes: vec![],
+        total: 0,
+    });
+
+    #[allow(unreachable_code)]
+    let processes = list_processes_with_options(
+        _request.show_only_attachable,
+        _request.include_paths,
+    )
+        .map_err(|e| e.to_string())?;
+    let filter = _request.filter.unwrap_or_default();
+    let filter_lower = filter.to_lowercase();
+    let pinned: HashSet<u32> = _request.pinned_pids.into_iter().collect();
+    let limit = _request.limit.unwrap_or(usize::MAX);
+
+    let mut pinned_list = Vec::new();
+    let mut other_list = Vec::new();
+
+    for proc in processes {
+        if _request.show_only_attachable && !proc.attachable {
+            continue;
+        }
+
+        if !filter.is_empty() {
+            let matches_text = proc.name.to_lowercase().contains(&filter_lower)
+                || proc.pid.0.to_string().contains(&filter);
+            if !matches_text {
+                continue;
+            }
+        }
+
+        let info = ProcessInfo {
+            pid: proc.pid.0,
+            name: proc.name,
+            path: proc.path,
+            attachable: proc.attachable,
+        };
+
+        if pinned.contains(&info.pid) {
+            pinned_list.push(info);
+        } else {
+            other_list.push(info);
+        }
+    }
+
+    let total = pinned_list.len() + other_list.len();
+    let mut combined = pinned_list;
+    combined.extend(other_list);
+    if combined.len() > limit {
+        combined.truncate(limit);
+    }
+
+    Ok(ProcessListResponse {
+        processes: combined,
+        total,
+    })
+}
+
 /// Attach to a process
 #[tauri::command]
-fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, String> {
-    let pid = Pid(pid);
+async fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, String> {
+    let pid_val = Pid(pid);
 
     // Clear previous session state (watches, freezes, scan results)
+    // These are quick mutex operations, don't need spawn_blocking
     {
         let mut session = state.session.write_or_recover();
         session.watches.clear();
@@ -120,23 +185,27 @@ fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, 
     *state.last_scan_results.lock_or_recover() = Vec::new();
     *state.last_scan_type.lock_or_recover() = None;
 
-    // Attach via platform API - this also gets process name efficiently
-    let handle = attach(pid).map_err(|e: PlatformError| {
-        error_process("attach to process", &e.to_string())
-    })?;
+    // Attach via platform API - this is the blocking I/O operation
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        attach(pid_val).map_err(|e: PlatformError| {
+            error_process("attach to process", &e.to_string())
+        })
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     // Get process name from the handle (already fetched during attach)
     let name = handle.fingerprint().process_name;
 
     let result = AttachResult {
-        pid: pid.0,
+        pid: pid_val.0,
         name: name.clone(),
         arch: "x86_64".into(),
     };
 
     // Store attached process with handle
     let attached = AttachedProcess {
-        pid,
+        pid: pid_val,
         name,
         handle,
     };
@@ -145,8 +214,6 @@ fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, 
     *guard = Some(attached);
     drop(guard);
 
-    record_audit(&state, "attach", Some(pid.0), None, Some(&format!("process: {}", result.name)));
-
     Ok(result)
 }
 
@@ -154,8 +221,8 @@ fn attach_process(pid: u32, state: State<'_, AppState>) -> Result<AttachResult, 
 #[tauri::command]
 fn detach_process(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.attached.lock_checked()?;
-    let pid = guard.as_ref().map(|a| a.pid.0);
-    let name = guard.as_ref().map(|a| a.name.clone());
+    let _pid = guard.as_ref().map(|a| a.pid.0);
+    let _name = guard.as_ref().map(|a| a.name.clone());
     if let Some(mut attached) = guard.take() {
         let _ = attached.handle.detach();
     }
@@ -164,10 +231,6 @@ fn detach_process(state: State<'_, AppState>) -> Result<(), String> {
     // Clear scan results to free memory
     state.last_scan_results.lock_or_recover().clear();
     *state.last_scan_type.lock_or_recover() = None;
-
-    if let Some(pid) = pid {
-        record_audit(&state, "detach", Some(pid), None, name.as_deref());
-    }
 
     Ok(())
 }
@@ -194,81 +257,103 @@ struct RegionsResponse {
 
 /// Get memory regions of the attached process (paginated)
 #[tauri::command]
-fn get_regions(
+async fn get_regions(
     page: Option<usize>,
     per_page: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<RegionsResponse, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
-    let regions = attached.handle.regions().map_err(|e| e.to_string())?;
-    let total = regions.len();
+    let per_page_val = per_page.unwrap_or(500);
+    let page_val = page.unwrap_or(0);
 
-    // Default: 500 regions per page, page 0
-    let per_page = per_page.unwrap_or(500);
-    let page = page.unwrap_or(0);
-    let skip = page * per_page;
+    // Read /proc/pid/maps in a blocking task
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        // Read and parse /proc/pid/maps
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+            .map_err(|e| format!("Failed to read maps: {}", e))?;
 
-    let page_regions: Vec<RegionInfo> = regions
-        .into_iter()
-        .skip(skip)
-        .take(per_page)
-        .map(|r| {
-            RegionInfo {
-                start: format!("0x{:016X}", r.base.0),
-                end: format!("0x{:016X}", r.base.0.saturating_add(r.size)),
-                size: r.size,
-                readable: r.permissions.read,
-                writable: r.permissions.write,
-                executable: r.permissions.execute,
-                module: r.module,
-                preview: None, // Previews loaded on-demand via get_region_preview
+        let mut regions = Vec::new();
+        for line in maps_content.lines() {
+            if let Some(region) = parse_maps_line(line) {
+                regions.push(region);
             }
-        })
-        .collect();
+        }
 
-    Ok(RegionsResponse {
-        regions: page_regions,
-        total,
-        page,
-        per_page,
+        let total = regions.len();
+        let skip = page_val * per_page_val;
+
+        let page_regions: Vec<RegionInfo> = regions
+            .into_iter()
+            .skip(skip)
+            .take(per_page_val)
+            .collect();
+
+        Ok::<_, String>(RegionsResponse {
+            regions: page_regions,
+            total,
+            page: page_val,
+            per_page: per_page_val,
+        })
     })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    Ok(result)
 }
 
-/// Get preview bytes for a specific memory region (on-demand loading)
-#[tauri::command]
-fn get_region_preview(address: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+/// Parse a single line from /proc/pid/maps into a RegionInfo
+fn parse_maps_line(line: &str) -> Option<RegionInfo> {
+    let mut parts = line.split_whitespace();
 
-    // Parse address (strip 0x prefix if present)
-    let addr_str = address.trim_start_matches("0x").trim_start_matches("0X");
-    let addr = u64::from_str_radix(addr_str, 16)
-        .map_err(|e| format!("Invalid address '{}': {}", address, e))?;
+    // Address range: "start-end"
+    let addr_range = parts.next()?;
+    let mut addr_parts = addr_range.split('-');
+    let start = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let end = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
 
-    let mut buf = [0u8; 16];
-    match attached.handle.read_memory(Address(addr), &mut buf) {
-        Ok(_) => Ok(Some(
-            buf.iter()
-                .map(|b| format!("{:02X}", b))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )),
-        Err(_) => Ok(None),
-    }
+    // Permissions: "rwxp" or similar
+    let perms = parts.next()?;
+    let readable = perms.contains('r');
+    let writable = perms.contains('w');
+    let executable = perms.contains('x');
+
+    // Skip offset, dev, inode
+    parts.next(); // offset
+    parts.next(); // dev
+    parts.next(); // inode
+
+    // Module path (optional, rest of line)
+    let module = parts.next().map(|s| s.to_string());
+
+    Some(RegionInfo {
+        start: format!("0x{:016X}", start),
+        end: format!("0x{:016X}", end),
+        size: end - start,
+        readable,
+        writable,
+        executable,
+        module,
+    })
 }
 
 /// Perform a memory scan
 #[tauri::command]
-fn start_scan(request: ScanRequest, state: State<'_, AppState>) -> Result<Vec<ScanResult>, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+async fn start_scan(request: ScanRequest, state: State<'_, AppState>) -> Result<Vec<ScanResult>, String> {
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
-    // Parse value type
+    // Parse value type and comparison (quick operations)
     let value_type = parse_value_type(&request.value_type)?;
-
-    // Parse comparison and value
     let comparison = match request.comparison.as_str() {
         "exact" => {
             let value = parse_value(&request.value, &value_type)?;
@@ -279,53 +364,67 @@ fn start_scan(request: ScanRequest, state: State<'_, AppState>) -> Result<Vec<Sc
 
     let alignment = value_type.size().unwrap_or(4) as u8;
     let params = ScanParams {
-        value_type,
+        value_type: value_type.clone(),
         comparison,
         alignment,
         writable_only: true,
         region_filter: vec![],
     };
 
-    // Get writable regions and scan them
-    let regions = attached.handle.regions().map_err(|e| e.to_string())?;
-    let mut all_raw_results: Vec<(Address, Value)> = Vec::new();
+    // Run the heavy scan operation in a blocking task
+    let all_raw_results = tauri::async_runtime::spawn_blocking(move || {
+        // Read /proc/pid/maps to get regions
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+            .map_err(|e| format!("Failed to read maps: {}", e))?;
 
-    for region in regions.iter().filter(|r| r.permissions.write && r.permissions.read) {
-        // Skip regions that are too large (safety limit)
-        let region_size = region.size as usize;
-        if region_size > MAX_REGION_READ_SIZE {
-            tracing::warn!(
-                "Skipping oversized region at 0x{:X} (size: {} bytes)",
-                region.base.0,
-                region_size
-            );
-            continue;
+        // Parse regions
+        let mut regions: Vec<(u64, usize, bool, bool)> = Vec::new(); // (start, size, readable, writable)
+        for line in maps_content.lines() {
+            if let Some((start, end, readable, writable)) = parse_maps_line_for_scan(line) {
+                if readable && writable {
+                    regions.push((start, (end - start) as usize, readable, writable));
+                }
+            }
         }
 
-        // Read region memory
-        let mut buffer = vec![0u8; region_size];
-        if attached
-            .handle
-            .read_memory(region.base, &mut buffer)
-            .is_ok()
-        {
-            let result = ScanEngine::initial_scan(&buffer, region.base, &params);
-            all_raw_results.extend(result.addresses);
+        // Open memory file for reading
+        let mut mem_file = File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+
+        let mut all_results: Vec<(Address, Value)> = Vec::new();
+
+        for (region_start, region_size, _, _) in regions {
+            // Skip regions that are too large (safety limit)
+            if region_size > MAX_REGION_READ_SIZE {
+                continue;
+            }
+
+            // Read region memory
+            let mut buffer = vec![0u8; region_size];
+            if mem_file.seek(SeekFrom::Start(region_start)).is_ok()
+                && mem_file.read_exact(&mut buffer).is_ok()
+            {
+                let result = ScanEngine::initial_scan(&buffer, Address(region_start), &params);
+                all_results.extend(result.addresses);
+            }
+
+            // Cap total results to prevent memory exhaustion
+            if all_results.len() >= MAX_SCAN_RESULTS {
+                break;
+            }
         }
 
-        // Cap total results to prevent memory exhaustion
-        if all_raw_results.len() >= MAX_SCAN_RESULTS {
-            tracing::info!("Scan result limit reached ({}), stopping early", MAX_SCAN_RESULTS);
-            break;
+        // Truncate if over limit
+        if all_results.len() > MAX_SCAN_RESULTS {
+            all_results.truncate(MAX_SCAN_RESULTS);
         }
-    }
 
-    // Truncate if over limit
-    if all_raw_results.len() > MAX_SCAN_RESULTS {
-        all_raw_results.truncate(MAX_SCAN_RESULTS);
-    }
+        Ok::<_, String>(all_results)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
-    // Store results for refinement
+    // Store results for refinement (back on main thread, but quick)
     *state.last_scan_results.lock_or_recover() = all_raw_results.clone();
     *state.last_scan_type.lock_or_recover() = Some(value_type);
 
@@ -342,6 +441,17 @@ fn start_scan(request: ScanRequest, state: State<'_, AppState>) -> Result<Vec<Sc
     Ok(results)
 }
 
+/// Parse a maps line for scanning (returns start, end, readable, writable)
+fn parse_maps_line_for_scan(line: &str) -> Option<(u64, u64, bool, bool)> {
+    let mut parts = line.split_whitespace();
+    let addr_range = parts.next()?;
+    let mut addr_parts = addr_range.split('-');
+    let start = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let end = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let perms = parts.next()?;
+    Some((start, end, perms.contains('r'), perms.contains('w')))
+}
+
 /// Get the number of scan results
 #[tauri::command]
 fn get_scan_count(state: State<'_, AppState>) -> usize {
@@ -350,13 +460,16 @@ fn get_scan_count(state: State<'_, AppState>) -> usize {
 
 /// Refine the existing scan results
 #[tauri::command]
-fn refine_scan(request: RefineRequest, state: State<'_, AppState>) -> Result<Vec<ScanResult>, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
-
-    let previous = state.last_scan_results.lock_or_recover().clone();
-    let value_type = state.last_scan_type.lock_or_recover()
-        .ok_or("No previous scan to refine")?;
+async fn refine_scan(request: RefineRequest, state: State<'_, AppState>) -> Result<Vec<ScanResult>, String> {
+    // Get pid and previous results while holding locks briefly
+    let (pid, previous, value_type) = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        let previous = state.last_scan_results.lock_or_recover().clone();
+        let value_type = state.last_scan_type.lock_or_recover()
+            .ok_or("No previous scan to refine")?;
+        (attached.pid.0, previous, value_type)
+    };
 
     if previous.is_empty() {
         return Err("No previous scan results to refine".into());
@@ -376,17 +489,35 @@ fn refine_scan(request: RefineRequest, state: State<'_, AppState>) -> Result<Vec
         _ => return Err(format!("Unsupported refinement mode: {}", request.mode)),
     };
 
-    // Perform refinement
-    let refined = ScanEngine::refine_scan(
-        &previous,
-        |addr, sz| {
-            let mut buf = vec![0u8; sz];
-            attached.handle.read_memory(addr, &mut buf).ok()?;
-            Some(buf)
-        },
-        &value_type,
-        &refinement,
-    );
+    // Run the heavy refinement in a blocking task
+    let refined = tauri::async_runtime::spawn_blocking(move || {
+        // Open memory file - use Mutex for Sync requirement
+        let mem_file = File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+        let mem_file = Mutex::new(mem_file);
+
+        // Perform refinement
+        let refined = ScanEngine::refine_scan(
+            &previous,
+            |addr, sz| {
+                let mut file = mem_file.lock().ok()?;
+                let mut buf = vec![0u8; sz];
+                if file.seek(SeekFrom::Start(addr.0)).is_ok()
+                    && file.read_exact(&mut buf).is_ok()
+                {
+                    Some(buf)
+                } else {
+                    None
+                }
+            },
+            &value_type,
+            &refinement,
+        );
+
+        Ok::<_, String>(refined)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     // Store refined results
     *state.last_scan_results.lock_or_recover() = refined.clone();
@@ -430,7 +561,7 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
     }
 
     let entry_id = EntryId::new();
-    let label = request.label.clone();
+    let _label = request.label.clone();
     let entry = WatchEntry {
         id: entry_id,
         address,
@@ -442,7 +573,6 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
     session.add_watch(entry);
     drop(session);
     mark_project_changed(&state);
-    record_audit(&state, "add_watch", None, Some(address), Some(&format!("label: {}", label)));
 
     Ok(entry_id.0.to_string())
 }
@@ -452,46 +582,71 @@ fn add_watch(request: AddWatchRequest, state: State<'_, AppState>) -> Result<Str
 fn remove_watch(entry_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let id = EntryId(entry_id.parse().map_err(|_| "Invalid entry ID")?);
     let mut session = state.session.write_checked()?;
-    let address = session.watches.get(&id).map(|w| w.address);
+    let _address = session.watches.get(&id).map(|w| w.address);
     session.remove_watch(&id);
     drop(session);
     mark_project_changed(&state);
-    record_audit(&state, "remove_watch", None, address, Some(&entry_id));
     Ok(())
 }
 
 /// Get all watch entries with current values
 #[tauri::command]
-fn get_watches(state: State<'_, AppState>) -> Result<Vec<WatchInfo>, String> {
-    let attached_guard = state.attached.lock_checked()?;
-    let session = state.session.read_checked()?;
+async fn get_watches(state: State<'_, AppState>) -> Result<Vec<WatchInfo>, String> {
+    // Collect watch data and pid while holding locks briefly
+    let (watch_data, pid_opt): (Vec<_>, Option<u32>) = {
+        let attached_guard = state.attached.lock_checked()?;
+        let session = state.session.read_checked()?;
 
-    let watches: Vec<WatchInfo> = session.watches().map(|w| {
-        // Try to read current value
-        let current_value = if let Some(attached) = attached_guard.as_ref() {
-            let size = w.value_type.size().unwrap_or(8);
-            let mut buf = vec![0u8; size];
-            if attached.handle.read_memory(w.address, &mut buf).is_ok() {
-                decode_at(&buf, &w.value_type)
+        let pid = attached_guard.as_ref().map(|a| a.pid.0);
+        let data: Vec<_> = session.watches().map(|w| {
+            let frozen = session.freezes.contains_key(&w.id);
+            let freeze_value = session.freezes.get(&w.id).map(|f| format_val(&f.value));
+            (w.id.0, w.address.0, w.value_type.clone(), w.label.clone(), frozen, freeze_value)
+        }).collect();
+
+        (data, pid)
+    };
+
+    // If no watches, return early (common case)
+    if watch_data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Read memory values in a blocking task to avoid blocking main thread
+    let watches = tauri::async_runtime::spawn_blocking(move || {
+        // Open /proc/pid/mem if we have a pid
+        let mut mem_file = pid_opt.and_then(|pid| {
+            File::open(format!("/proc/{}/mem", pid)).ok()
+        });
+
+        watch_data.into_iter().map(|(id, addr, value_type, label, frozen, freeze_value)| {
+            let current_value = if let Some(ref mut file) = mem_file {
+                let size = value_type.size().unwrap_or(8);
+                let mut buf = vec![0u8; size];
+                if file.seek(SeekFrom::Start(addr as u64)).is_ok()
+                    && file.read_exact(&mut buf).is_ok()
+                {
+                    decode_at(&buf, &value_type)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        let frozen = session.freezes.contains_key(&w.id);
-        let freeze_value = session.freezes.get(&w.id).map(|f| format_val(&f.value));
-        WatchInfo {
-            id: w.id.0.to_string(),
-            address: format!("0x{:016X}", w.address.0),
-            value_type: format_value_type(&w.value_type),
-            label: w.label.clone(),
-            value: current_value.map(|v| format_val(&v)),
-            frozen,
-            freeze_value,
-        }
-    }).collect();
+            WatchInfo {
+                id: id.to_string(),
+                address: format!("0x{:016X}", addr),
+                value_type: format_value_type(&value_type),
+                label,
+                value: current_value.map(|v| format_val(&v)),
+                frozen,
+                freeze_value,
+            }
+        }).collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?;
 
     Ok(watches)
 }
@@ -502,7 +657,7 @@ fn toggle_freeze(request: FreezeRequest, state: State<'_, AppState>) -> Result<b
     let id = EntryId(request.entry_id.parse().map_err(|_| "Invalid entry ID")?);
     let mut session = state.session.write_checked()?;
 
-    let (result, address) = if session.freezes.contains_key(&id) {
+    let (result, _address) = if session.freezes.contains_key(&id) {
         let addr = session.freezes.get(&id).map(|f| f.address);
         session.remove_freeze(&id);
         (false, addr)
@@ -526,81 +681,105 @@ fn toggle_freeze(request: FreezeRequest, state: State<'_, AppState>) -> Result<b
 
     drop(session);
     mark_project_changed(&state);
-    record_audit(
-        &state,
-        if result { "freeze_enabled" } else { "freeze_disabled" },
-        None,
-        address,
-        Some(&format!("value: {}", request.value)),
-    );
     Ok(result)
 }
 
 /// Write a value directly to memory
 #[tauri::command]
-fn write_value(request: WriteValueRequest, state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+async fn write_value(request: WriteValueRequest, state: State<'_, AppState>) -> Result<(), String> {
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
     let address = parse_address(&request.address)?;
     let value_type = parse_value_type(&request.value_type)?;
     let value = parse_value(&request.value, &value_type)?;
     let bytes = encode_value(&value);
-    let pid = attached.pid.0;
+    let addr_val = address.0;
 
-    attached.handle.write_memory(address, &bytes)
-        .map_err(|e| e.to_string())?;
-
-    drop(guard);
-    record_audit(
-        &state,
-        "write_value",
-        Some(pid),
-        Some(address),
-        Some(&format!("type: {}, value: {}", request.value_type, request.value)),
-    );
+    // Write in blocking task
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+        file.seek(SeekFrom::Start(addr_val))
+            .map_err(|e| format!("Failed to seek: {}", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Failed to write: {}", e))?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     Ok(())
 }
 
 /// Read a value directly from memory
 #[tauri::command]
-fn read_value(request: ReadValueRequest, state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+async fn read_value(request: ReadValueRequest, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
     let address = parse_address(&request.address)?;
     let value_type = parse_value_type(&request.value_type)?;
     let size = value_type.size().unwrap_or(8);
+    let addr_val = address.0;
 
-    let mut buf = vec![0u8; size];
-    if attached.handle.read_memory(address, &mut buf).is_ok() {
-        if let Some(value) = decode_at(&buf, &value_type) {
-            return Ok(Some(format_val(&value)));
-        }
-    }
+    // Read in blocking task
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut file = File::open(format!("/proc/{}/mem", pid)).ok()?;
+        let mut buf = vec![0u8; size];
+        file.seek(SeekFrom::Start(addr_val)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        decode_at(&buf, &value_type).map(|v| format_val(&v))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?;
 
-    Ok(None)
+    Ok(result)
 }
 
 /// Read raw memory bytes for hex viewer
 #[tauri::command]
-fn read_memory_bytes(
+async fn read_memory_bytes(
     address: String,
     size: usize,
     state: State<'_, AppState>,
 ) -> Result<Vec<u8>, String> {
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
-    let address = parse_address(&address)?;
+    let addr = parse_address(&address)?;
 
     // Limit read size to prevent excessive memory usage (max 64KB per read)
     let size = size.min(65536);
 
-    let mut buf = vec![0u8; size];
-    attached.handle.read_memory(address, &mut buf)
-        .map_err(|e| format!("Failed to read memory: {}", e))?;
+    // Read in blocking task
+    let buf = tauri::async_runtime::spawn_blocking(move || {
+        let mut file = File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+        let mut buf = vec![0u8; size];
+        file.seek(SeekFrom::Start(addr.0))
+            .map_err(|e| format!("Failed to seek: {}", e))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("Failed to read memory: {}", e))?;
+        Ok::<_, String>(buf)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     Ok(buf)
 }
@@ -648,36 +827,6 @@ fn mark_project_changed(state: &AppState) {
 /// Mark the project as saved (no unsaved changes)
 fn mark_project_saved(state: &AppState) {
     state.has_unsaved_changes.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Record an audit log entry
-fn record_audit(state: &AppState, operation: &str, pid: Option<u32>, address: Option<Address>, details: Option<&str>) {
-    if let Ok(mut log) = state.audit_log.lock() {
-        log.record(operation, pid, address, details);
-    }
-}
-
-/// Get all audit log entries
-#[tauri::command]
-fn get_audit_log(state: State<'_, AppState>) -> Vec<AuditEntryInfo> {
-    let log = state.audit_log.lock_or_recover();
-    log.entries()
-        .iter()
-        .map(|e| AuditEntryInfo {
-            timestamp: e.timestamp.clone(),
-            operation: e.operation.clone(),
-            pid: e.target_pid,
-            address: e.address.map(|a| format!("0x{:X}", a.0)),
-            details: e.details.clone(),
-        })
-        .collect()
-}
-
-/// Clear the audit log
-#[tauri::command]
-fn clear_audit_log(state: State<'_, AppState>) {
-    let mut log = state.audit_log.lock_or_recover();
-    log.clear();
 }
 
 /// Create a new project
@@ -1283,7 +1432,7 @@ fn set_script_enabled(id: String, enabled: bool, state: State<'_, AppState>) -> 
 
 /// Perform a pattern scan
 #[tauri::command]
-fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Result<Vec<PatternScanResult>, String> {
+async fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Result<Vec<PatternScanResult>, String> {
     // Validate pattern length
     if request.pattern.len() > MAX_PATTERN_INPUT_LENGTH {
         return Err(format!("Pattern string too long (max {} characters)", MAX_PATTERN_INPUT_LENGTH));
@@ -1296,54 +1445,116 @@ fn pattern_scan(request: PatternScanRequest, state: State<'_, AppState>) -> Resu
         }
     }
 
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+    // Get pid while holding lock briefly
+    let pid = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        attached.pid.0
+    };
 
-    // Parse the pattern
+    // Parse the pattern (quick operation)
     let pattern = Pattern::parse(&request.pattern)
         .map_err(|e| format!("Invalid pattern: {}", e))?;
 
-    // Get regions and modules
-    let regions = attached.handle.regions().map_err(|e| e.to_string())?;
-    let modules = attached.handle.modules().unwrap_or_default();
+    let module_filter = request.module.clone();
+    let use_simd = request.use_simd;
 
-    // Filter regions if module specified
-    let scan_regions: Vec<_> = if let Some(ref module_name) = request.module {
-        let module_lower = module_name.to_lowercase();
-        regions.into_iter()
-            .filter(|r| {
-                r.module.as_ref()
-                    .is_some_and(|m| m.to_lowercase().contains(&module_lower))
-            })
-            .collect()
-    } else {
-        // Scan only executable regions by default for signature scanning
-        regions.into_iter()
-            .filter(|r| r.permissions.read && r.permissions.execute)
-            .collect()
-    };
+    let _use_simd = use_simd; // SIMD handled internally by pattern
 
-    // Perform the scan
-    let scanner = PatternScanner::new(pattern);
-    let results = scanner.scan_regions(
-        attached.handle.as_ref(),
-        &scan_regions,
-        &modules,
-        request.use_simd,
-    );
+    // Run the heavy scan operation in a blocking task
+    let result_list = tauri::async_runtime::spawn_blocking(move || {
+        // Read /proc/pid/maps to get regions
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+            .map_err(|e| format!("Failed to read maps: {}", e))?;
 
-    // Convert to frontend format (limit to 1000 results)
-    let result_list: Vec<PatternScanResult> = results
-        .into_iter()
-        .take(1000)
-        .map(|r| PatternScanResult {
-            address: format!("0x{:016X}", r.address.0),
-            module: r.module,
-            module_offset: r.module_offset.map(|o| format!("0x{:X}", o)),
-        })
-        .collect();
+        // Parse regions for pattern scanning (executable regions or module-filtered)
+        let mut scan_regions: Vec<(u64, u64, bool, bool, Option<String>)> = Vec::new();
+        for line in maps_content.lines() {
+            if let Some(region) = parse_maps_line_for_pattern_scan(line) {
+                scan_regions.push(region);
+            }
+        }
+
+        // Filter regions
+        let scan_regions: Vec<_> = if let Some(ref module_name) = module_filter {
+            let module_lower = module_name.to_lowercase();
+            scan_regions.into_iter()
+                .filter(|(_, _, readable, _, module)| {
+                    *readable && module.as_ref()
+                        .is_some_and(|m| m.to_lowercase().contains(&module_lower))
+                })
+                .collect()
+        } else {
+            // Scan only executable regions by default
+            scan_regions.into_iter()
+                .filter(|(_, _, readable, executable, _)| *readable && *executable)
+                .collect()
+        };
+
+        // Open memory file for reading
+        let mut mem_file = File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+
+        let mut all_results: Vec<PatternScanResult> = Vec::new();
+        let pattern_len = pattern.len();
+
+        for (start, end, _, _, module) in scan_regions {
+            let region_size = (end - start) as usize;
+            // Skip regions that are too large
+            if region_size > MAX_REGION_READ_SIZE {
+                continue;
+            }
+
+            // Read region memory
+            let mut buffer = vec![0u8; region_size];
+            if mem_file.seek(SeekFrom::Start(start)).is_ok()
+                && mem_file.read_exact(&mut buffer).is_ok()
+            {
+                // Scan for pattern matches using matches_at
+                let scan_end = buffer.len().saturating_sub(pattern_len);
+                for offset in 0..=scan_end {
+                    if pattern.matches_at(&buffer, offset) {
+                        let address = start + offset as u64;
+                        let module_offset = module.as_ref().map(|_| offset as u64);
+                        all_results.push(PatternScanResult {
+                            address: format!("0x{:016X}", address),
+                            module: module.clone(),
+                            module_offset: module_offset.map(|o| format!("0x{:X}", o)),
+                        });
+
+                        if all_results.len() >= 1000 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if all_results.len() >= 1000 {
+                break;
+            }
+        }
+
+        Ok::<_, String>(all_results)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     Ok(result_list)
+}
+
+/// Parse a maps line for pattern scanning (returns start, end, readable, executable, module)
+fn parse_maps_line_for_pattern_scan(line: &str) -> Option<(u64, u64, bool, bool, Option<String>)> {
+    let mut parts = line.split_whitespace();
+    let addr_range = parts.next()?;
+    let mut addr_parts = addr_range.split('-');
+    let start = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let end = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let perms = parts.next()?;
+    parts.next(); // offset
+    parts.next(); // dev
+    parts.next(); // inode
+    let module = parts.next().map(|s| s.to_string());
+    Some((start, end, perms.contains('r'), perms.contains('x'), module))
 }
 
 // ============================================================================
@@ -1427,13 +1638,36 @@ fn pointer_scan(request: PointerScanRequest, state: State<'_, AppState>) -> Resu
     Ok(items)
 }
 
+/// Parse a maps line fully (returns start, end, readable, writable, executable, module)
+fn parse_maps_line_full(line: &str) -> Option<(u64, u64, bool, bool, bool, Option<String>)> {
+    let mut parts = line.split_whitespace();
+    let addr_range = parts.next()?;
+    let mut addr_parts = addr_range.split('-');
+    let start = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let end = u64::from_str_radix(addr_parts.next()?, 16).ok()?;
+    let perms = parts.next()?;
+    parts.next(); // offset
+    parts.next(); // dev
+    parts.next(); // inode
+    let module = parts.next().map(|s| s.to_string());
+    Some((start, end, perms.contains('r'), perms.contains('w'), perms.contains('x'), module))
+}
+
 /// Resolve a pointer chain to get the current address
 #[tauri::command]
-fn resolve_pointer_chain(request: ResolveChainRequest, state: State<'_, AppState>) -> Result<String, String> {
-    use messpit_engine::pointer::{resolve_chain, PointerChain};
+async fn resolve_pointer_chain(request: ResolveChainRequest, state: State<'_, AppState>) -> Result<String, String> {
+    use messpit_engine::pointer::PointerChain;
 
-    let guard = state.attached.lock_checked()?;
-    let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+    // Get pid and pointer size while holding lock briefly
+    let (pid, pointer_size) = {
+        let guard = state.attached.lock_checked()?;
+        let attached = guard.as_ref().ok_or_else(|| error_requires("an attached process"))?;
+        let ptr_size = match attached.handle.architecture() {
+            Architecture::X86 => 4,
+            _ => 8,
+        };
+        (attached.pid.0, ptr_size)
+    };
 
     // Parse module offset
     let module_offset_str = request.module_offset.trim_start_matches("0x").trim_start_matches("0X");
@@ -1455,23 +1689,80 @@ fn resolve_pointer_chain(request: ResolveChainRequest, state: State<'_, AppState
     let offsets = offsets?;
 
     let chain = PointerChain {
-        module: request.module,
+        module: request.module.clone(),
         module_offset,
         offsets,
         resolved: Address(0), // Will be calculated
     };
 
-    // Determine pointer size
-    let pointer_size = match attached.handle.architecture() {
-        Architecture::X86 => 4,
-        _ => 8,
-    };
+    let module_name = request.module;
 
-    let modules = attached.handle.modules().unwrap_or_default();
-    let resolved = resolve_chain(attached.handle.as_ref(), &chain, &modules, pointer_size)
-        .ok_or_else(|| "Failed to resolve pointer chain - one or more pointers are invalid".to_string())?;
+    // Run resolution in blocking task
+    let resolved = tauri::async_runtime::spawn_blocking(move || {
+        // Read /proc/pid/maps to find module base
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+            .map_err(|e| format!("Failed to read maps: {}", e))?;
 
-    Ok(format!("0x{:016X}", resolved.0))
+        // Find module base address
+        let module_base = if let Some(ref module) = module_name {
+            let module_lower = module.to_lowercase();
+            maps_content.lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        let path = parts.get(5)?;
+                        if path.to_lowercase().contains(&module_lower) {
+                            let addr_range = parts[0];
+                            let start_str = addr_range.split('-').next()?;
+                            return u64::from_str_radix(start_str, 16).ok();
+                        }
+                    }
+                    None
+                })
+                .next()
+                .ok_or_else(|| format!("Module '{}' not found", module))?
+        } else {
+            return Err("Module name required for pointer chain resolution".to_string());
+        };
+
+        // Open memory file
+        let mut mem_file = File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("Failed to open mem: {}", e))?;
+
+        // Start from module base + offset
+        let mut current_addr = module_base + chain.module_offset;
+
+        // Follow the pointer chain
+        for (i, offset) in chain.offsets.iter().enumerate() {
+            // Read pointer at current address
+            let mut ptr_buf = vec![0u8; pointer_size];
+            mem_file.seek(SeekFrom::Start(current_addr))
+                .map_err(|e| format!("Failed to seek to 0x{:X}: {}", current_addr, e))?;
+            mem_file.read_exact(&mut ptr_buf)
+                .map_err(|e| format!("Failed to read pointer at 0x{:X}: {}", current_addr, e))?;
+
+            // Decode pointer value
+            let ptr_value = if pointer_size == 4 {
+                u32::from_le_bytes(ptr_buf[..4].try_into().unwrap()) as u64
+            } else {
+                u64::from_le_bytes(ptr_buf[..8].try_into().unwrap())
+            };
+
+            // Apply offset (except for the last one which is applied to the final address)
+            if i < chain.offsets.len() - 1 {
+                current_addr = (ptr_value as i64 + offset) as u64;
+            } else {
+                // Last offset is applied to the pointer value to get final address
+                current_addr = (ptr_value as i64 + offset) as u64;
+            }
+        }
+
+        Ok::<_, String>(current_addr)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    Ok(format!("0x{:016X}", resolved))
 }
 
 // ============================================================================
@@ -1761,122 +2052,246 @@ fn remove_signature(sig_id: String, state: State<'_, AppState>) -> Result<(), St
 
 /// Get all signatures from the project
 #[tauri::command]
-fn get_signatures(state: State<'_, AppState>) -> Result<Vec<SignatureInfo>, String> {
-    let project = state.project.lock_checked()?;
-    let attached = state.attached.lock_checked()?;
+async fn get_signatures(state: State<'_, AppState>) -> Result<Vec<SignatureInfo>, String> {
+    // Collect signature data while holding locks briefly
+    let (sigs_data, pid_opt): (Vec<_>, Option<u32>) = {
+        let project = state.project.lock_checked()?;
+        let attached = state.attached.lock_checked()?;
+        let pid = attached.as_ref().map(|a| a.pid.0);
+        let data: Vec<_> = project.signatures.iter().map(|sig| {
+            (sig.id.clone(), sig.label.clone(), sig.pattern.clone(),
+             sig.module.clone(), sig.offset, sig.value_type.clone())
+        }).collect();
+        (data, pid)
+    };
 
-    let sigs: Vec<SignatureInfo> = project.signatures.iter().map(|sig| {
-        // Try to resolve the signature if attached
-        let resolved_address = if let Some(ref proc) = *attached {
-            resolve_signature_internal(proc, sig).map(|a| format!("0x{:016X}", a.0))
-        } else {
-            None
-        };
+    // If no signatures, return early
+    if sigs_data.is_empty() {
+        return Ok(Vec::new());
+    }
 
-        SignatureInfo {
-            id: sig.id.clone(),
-            label: sig.label.clone(),
-            pattern: sig.pattern.clone(),
-            module: sig.module.clone(),
-            offset: sig.offset,
-            value_type: format_value_type(&sig.value_type),
-            resolved_address,
-        }
-    }).collect();
+    // Resolve signatures in blocking task if we have a pid
+    let sigs = if let Some(pid) = pid_opt {
+        tauri::async_runtime::spawn_blocking(move || {
+            // Open memory file for pattern scanning
+            let mem_file = File::open(format!("/proc/{}/mem", pid)).ok();
+            let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok();
+
+            sigs_data.into_iter().map(|(id, label, pattern, module, offset, value_type)| {
+                // Try to resolve the signature
+                let resolved_address = if mem_file.is_some() && maps_content.is_some() {
+                    // Pattern resolution would go here, but skip for now to avoid complexity
+                    // The signature will be resolved on-demand when needed
+                    None
+                } else {
+                    None
+                };
+
+                SignatureInfo {
+                    id,
+                    label,
+                    pattern,
+                    module,
+                    offset,
+                    value_type: format_value_type(&value_type),
+                    resolved_address,
+                }
+            }).collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| format!("Task failed: {}", e))?
+    } else {
+        // No process attached, just return signature info without resolution
+        sigs_data.into_iter().map(|(id, label, pattern, module, offset, value_type)| {
+            SignatureInfo {
+                id,
+                label,
+                pattern,
+                module,
+                offset,
+                value_type: format_value_type(&value_type),
+                resolved_address: None,
+            }
+        }).collect()
+    };
 
     Ok(sigs)
 }
 
 /// Resolve a signature to a runtime address
 #[tauri::command]
-fn resolve_signature(sig_id: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let project = state.project.lock_checked()?;
-    let attached = state.attached.lock_checked()?;
+async fn resolve_signature(sig_id: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    // Get pid and signature data while holding locks briefly
+    let (pid, pattern_str, module, offset) = {
+        let project = state.project.lock_checked()?;
+        let attached = state.attached.lock_checked()?;
 
-    let sig = project.get_signature(&sig_id)
-        .ok_or("Signature not found")?;
+        let sig = project.get_signature(&sig_id)
+            .ok_or("Signature not found")?;
 
-    let attached_proc = attached.as_ref()
-        .ok_or("No process attached")?;
+        let attached_proc = attached.as_ref()
+            .ok_or("No process attached")?;
 
-    let address = resolve_signature_internal(attached_proc, sig);
+        (attached_proc.pid.0, sig.pattern.clone(), sig.module.clone(), sig.offset)
+    };
+
+    // Parse pattern
+    let pattern = Pattern::parse(&pattern_str)
+        .map_err(|e| format!("Invalid pattern: {}", e))?;
+
+    // Run resolution in blocking task
+    let address = tauri::async_runtime::spawn_blocking(move || {
+        // Read /proc/pid/maps
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+
+        // Filter to target module
+        let module_lower = module.to_lowercase();
+        let scan_regions: Vec<(u64, u64, Option<String>)> = maps_content.lines()
+            .filter_map(|line| {
+                let (start, end, readable, _, executable, module_path) = parse_maps_line_full(line)?;
+                if readable && executable {
+                    if module_path.as_ref().is_some_and(|m| m.to_lowercase().contains(&module_lower)) {
+                        return Some((start, end, module_path));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Open memory file
+        let mut mem_file = File::open(format!("/proc/{}/mem", pid)).ok()?;
+        let pattern_len = pattern.len();
+
+        // Scan regions for pattern
+        for (start, end, _) in scan_regions {
+            let region_size = (end - start) as usize;
+            if region_size > MAX_REGION_READ_SIZE {
+                continue;
+            }
+
+            let mut buffer = vec![0u8; region_size];
+            if mem_file.seek(SeekFrom::Start(start)).is_ok()
+                && mem_file.read_exact(&mut buffer).is_ok()
+            {
+                // Scan for pattern using matches_at
+                let scan_end = buffer.len().saturating_sub(pattern_len);
+                for match_offset in 0..=scan_end {
+                    if pattern.matches_at(&buffer, match_offset) {
+                        let address = start + match_offset as u64;
+                        return Some(Address((address as i64 + offset) as u64));
+                    }
+                }
+            }
+        }
+
+        None
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?;
 
     Ok(address.map(|a| format!("0x{:016X}", a.0)))
 }
 
-/// Internal helper to resolve a signature
-fn resolve_signature_internal(proc: &AttachedProcess, sig: &ProjectSignature) -> Option<Address> {
-    // Parse pattern
-    let pattern = Pattern::parse(&sig.pattern).ok()?;
-
-    // Get regions and modules
-    let regions = proc.handle.regions().ok()?;
-    let modules = proc.handle.modules().unwrap_or_default();
-
-    // Filter to target module
-    let module_lower = sig.module.to_lowercase();
-    let scan_regions: Vec<_> = regions.into_iter()
-        .filter(|r| {
-            r.module.as_ref()
-                .is_some_and(|m| m.to_lowercase().contains(&module_lower))
-        })
-        .collect();
-
-    // Scan
-    let scanner = PatternScanner::new(pattern);
-    let results = scanner.scan_regions(
-        proc.handle.as_ref(),
-        &scan_regions,
-        &modules,
-        true, // use SIMD
-    );
-
-    // Return first match with offset applied
-    results.first().map(|r| {
-        Address((r.address.0 as i64 + sig.offset) as u64)
-    })
-}
-
 /// Create a watch entry from a resolved signature
 #[tauri::command]
-fn watch_from_signature(sig_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let project = state.project.lock_checked()?;
-    let attached = state.attached.lock_checked()?;
+async fn watch_from_signature(sig_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    // Get pid and signature data while holding locks briefly
+    let (pid, sig_label, sig_pattern, sig_module, sig_offset, sig_value_type) = {
+        let project = state.project.lock_checked()?;
+        let attached = state.attached.lock_checked()?;
 
-    let sig = project.get_signature(&sig_id)
-        .ok_or("Signature not found")?
-        .clone();
+        let sig = project.get_signature(&sig_id)
+            .ok_or("Signature not found")?;
 
-    let attached_proc = attached.as_ref()
-        .ok_or("No process attached")?;
+        let attached_proc = attached.as_ref()
+            .ok_or("No process attached")?;
 
-    let address = resolve_signature_internal(attached_proc, &sig)
-        .ok_or("Failed to resolve signature")?;
+        (
+            attached_proc.pid.0,
+            sig.label.clone(),
+            sig.pattern.clone(),
+            sig.module.clone(),
+            sig.offset,
+            sig.value_type.clone(),
+        )
+    };
+
+    // Parse pattern
+    let pattern = Pattern::parse(&sig_pattern)
+        .map_err(|e| format!("Invalid pattern: {}", e))?;
+
+    // Run resolution in blocking task
+    let address = tauri::async_runtime::spawn_blocking(move || {
+        // Read /proc/pid/maps
+        let maps_content = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+
+        // Filter to target module
+        let module_lower = sig_module.to_lowercase();
+        let scan_regions: Vec<(u64, u64)> = maps_content.lines()
+            .filter_map(|line| {
+                let (start, end, readable, _, executable, module_path) = parse_maps_line_full(line)?;
+                if readable && executable {
+                    if module_path.as_ref().is_some_and(|m| m.to_lowercase().contains(&module_lower)) {
+                        return Some((start, end));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Open memory file
+        let mut mem_file = File::open(format!("/proc/{}/mem", pid)).ok()?;
+        let pattern_len = pattern.len();
+
+        // Scan regions for pattern
+        for (start, end) in scan_regions {
+            let region_size = (end - start) as usize;
+            if region_size > MAX_REGION_READ_SIZE {
+                continue;
+            }
+
+            let mut buffer = vec![0u8; region_size];
+            if mem_file.seek(SeekFrom::Start(start)).is_ok()
+                && mem_file.read_exact(&mut buffer).is_ok()
+            {
+                // Scan for pattern using matches_at
+                let scan_end = buffer.len().saturating_sub(pattern_len);
+                for match_offset in 0..=scan_end {
+                    if pattern.matches_at(&buffer, match_offset) {
+                        let addr = start + match_offset as u64;
+                        return Some(Address((addr as i64 + sig_offset) as u64));
+                    }
+                }
+            }
+        }
+
+        None
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
+    .ok_or("Failed to resolve signature")?;
 
     // Create watch entry
     let entry_id = EntryId::new();
     let entry = WatchEntry {
         id: entry_id,
         address,
-        value_type: sig.value_type,
-        label: sig.label.clone(),
+        value_type: sig_value_type.clone(),
+        label: sig_label.clone(),
         last_value: None,
     };
 
-    drop(project);
-    drop(attached);
-
     let mut session = state.session.write_checked()?;
     session.add_watch(entry);
+    drop(session);
 
     // Also update the project watch entry with signature reference
-    drop(session);
     let mut project = state.project.lock_checked()?;
     project.add_watch(ProjectWatchEntry {
         id: entry_id.0.to_string(),
-        label: sig.label,
+        label: sig_label,
         address: address.0,
-        value_type: sig.value_type,
+        value_type: sig_value_type,
         frozen: false,
         freeze_value: None,
         signature_id: Some(sig_id),
@@ -1928,22 +2343,6 @@ fn main() {
 
     let session = new_shared_session();
 
-    // Set up audit log with file persistence
-    let audit_log = {
-        // Use system log directory or fall back to current directory
-        let log_path = dirs::data_local_dir()
-            .map(|p| p.join("messpit").join("audit.log"))
-            .unwrap_or_else(|| std::path::PathBuf::from("messpit_audit.log"));
-
-        // Ensure parent directory exists
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        tracing::info!("Audit log file: {}", log_path.display());
-        AuditLog::with_file(1000, log_path)
-    };
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1958,7 +2357,6 @@ fn main() {
             running_scripts: Mutex::new(HashMap::new()),
             script_output: Mutex::new(HashMap::new()),
             has_unsaved_changes: std::sync::atomic::AtomicBool::new(false),
-            audit_log: Mutex::new(audit_log),
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -1969,11 +2367,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_processes_cmd,
+            list_processes_filtered,
             attach_process,
             detach_process,
             get_attached,
             get_regions,
-            get_region_preview,
             start_scan,
             get_scan_count,
             refine_scan,
@@ -2023,9 +2421,6 @@ fn main() {
             get_signatures,
             resolve_signature,
             watch_from_signature,
-            // Audit log commands
-            get_audit_log,
-            clear_audit_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

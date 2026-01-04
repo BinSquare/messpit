@@ -3,11 +3,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use chrono::Utc;
 use messpit_policy::{Policy, PolicyDecision};
 use messpit_protocol::{
-    Address, AuditEntry, CommandEnvelope, CommandId, DetachReason, EngineCommand, EngineError,
-    EngineEvent, ErrorCode, EventEnvelope, JobId, PatternMatch, RunId, ScriptStatus,
+    Address, CommandEnvelope, CommandId, DetachReason, EngineCommand, EngineError, EngineEvent,
+    ErrorCode, EventEnvelope, JobId, PatternMatch, RunId, ScriptStatus,
 };
 
 use crate::{
@@ -49,123 +48,6 @@ pub enum JobType {
     Script { run_id: RunId },
 }
 
-/// Audit logger for tracking mutating operations
-pub struct AuditLog {
-    entries: Vec<AuditEntry>,
-    max_entries: usize,
-    /// Optional file path for persistent logging
-    log_file: Option<std::path::PathBuf>,
-}
-
-impl AuditLog {
-    pub fn new(max_entries: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            max_entries,
-            log_file: None,
-        }
-    }
-
-    /// Create an audit log with file persistence
-    pub fn with_file(max_entries: usize, log_path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            entries: Vec::new(),
-            max_entries,
-            log_file: Some(log_path.into()),
-        }
-    }
-
-    /// Set the log file path
-    pub fn set_log_file(&mut self, path: impl Into<std::path::PathBuf>) {
-        self.log_file = Some(path.into());
-    }
-
-    pub fn record(&mut self, operation: &str, target_pid: Option<u32>, address: Option<Address>, details: Option<&str>) -> AuditEntry {
-        let entry = AuditEntry {
-            timestamp: Utc::now().to_rfc3339(),
-            operation: operation.to_string(),
-            target_pid,
-            address,
-            details: details.map(String::from),
-        };
-
-        // Log to tracing (stdout/stderr)
-        let addr_str = address.map(|a| format!("0x{:X}", a.0)).unwrap_or_default();
-        let pid_str = target_pid.map(|p| p.to_string()).unwrap_or_default();
-        let details_str = details.unwrap_or("");
-        tracing::info!(
-            target: "audit",
-            operation = %operation,
-            pid = %pid_str,
-            address = %addr_str,
-            details = %details_str,
-            "[AUDIT] {} | pid={} addr={} | {}",
-            operation, pid_str, addr_str, details_str
-        );
-
-        // Write to file if configured
-        if let Some(ref path) = self.log_file {
-            self.write_to_file(path, &entry);
-        }
-
-        // Store in memory
-        self.entries.push(entry.clone());
-        if self.entries.len() > self.max_entries {
-            self.entries.remove(0);
-        }
-        entry
-    }
-
-    fn write_to_file(&self, path: &std::path::Path, entry: &AuditEntry) {
-        use std::io::Write;
-
-        let line = format!(
-            "{} | {} | pid={} | addr={} | {}\n",
-            entry.timestamp,
-            entry.operation,
-            entry.target_pid.map(|p| p.to_string()).unwrap_or_default(),
-            entry.address.map(|a| format!("0x{:X}", a.0)).unwrap_or_default(),
-            entry.details.as_deref().unwrap_or("")
-        );
-
-        // Append to file, create if doesn't exist
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(line.as_bytes()) {
-                    tracing::warn!("Failed to write audit log to file: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to open audit log file: {}", e);
-            }
-        }
-    }
-
-    pub fn entries(&self) -> &[AuditEntry] {
-        &self.entries
-    }
-
-    /// Get entries as a cloned Vec (for serialization)
-    pub fn entries_cloned(&self) -> Vec<AuditEntry> {
-        self.entries.clone()
-    }
-
-    /// Clear all entries
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-}
-
-impl Default for AuditLog {
-    fn default() -> Self {
-        Self::new(1000)
-    }
-}
-
 /// Engine router that processes commands and emits events
 pub struct Router {
     session: SharedSession,
@@ -173,8 +55,6 @@ pub struct Router {
     policy: Policy,
     /// Active jobs (pattern scans, scripts)
     jobs: Arc<RwLock<HashMap<JobId, ActiveJob>>>,
-    /// Audit log for tracking operations
-    audit_log: Arc<RwLock<AuditLog>>,
     /// Current project state
     project: Arc<RwLock<Project>>,
     /// Tracks if project has unsaved changes
@@ -189,7 +69,6 @@ impl Router {
             transport,
             policy: Policy::default(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
-            audit_log: Arc::new(RwLock::new(AuditLog::default())),
             project: Arc::new(RwLock::new(Project::default())),
             has_unsaved_changes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -202,7 +81,6 @@ impl Router {
             transport,
             policy: Policy::permissive(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
-            audit_log: Arc::new(RwLock::new(AuditLog::default())),
             project: Arc::new(RwLock::new(Project::default())),
             has_unsaved_changes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -226,21 +104,6 @@ impl Router {
     /// Get the current project
     pub fn project(&self) -> Arc<RwLock<Project>> {
         self.project.clone()
-    }
-
-    /// Get the audit log
-    pub fn audit_log(&self) -> Arc<RwLock<AuditLog>> {
-        self.audit_log.clone()
-    }
-
-    /// Record an audit entry and emit it as an event
-    fn record_audit(&self, operation: &str, target_pid: Option<u32>, address: Option<Address>, details: Option<&str>) {
-        if let Ok(mut log) = self.audit_log.write() {
-            let entry = log.record(operation, target_pid, address, details);
-            let _ = self.transport.send(EventEnvelope::unsolicited(
-                EngineEvent::AuditRecord { record: entry },
-            ));
-        }
     }
 
     /// Process a single command and emit response events
@@ -465,15 +328,7 @@ impl Router {
             EngineError::new(ErrorCode::InvalidAddress, e.to_string())
         })?;
 
-        // Record audit entry
-        let pid = process.pid().0;
-        drop(session); // Release lock before recording audit
-        self.record_audit(
-            "write_value",
-            Some(pid),
-            Some(address),
-            Some(&format!("reason: {}, value: {:?}", reason, value)),
-        );
+        drop(session);
         self.mark_changed();
 
         Ok(vec![EngineEvent::ValueWritten { address }])
@@ -497,12 +352,6 @@ impl Router {
         });
 
         drop(session);
-        self.record_audit(
-            "add_watch",
-            None,
-            Some(address),
-            Some(&format!("label: {}, type: {:?}", label, ty)),
-        );
         self.mark_changed();
 
         Ok(vec![])
@@ -515,7 +364,6 @@ impl Router {
         let mut session = self.session.write_or_error()?;
         session.remove_watch(&entry_id);
         drop(session);
-        self.record_audit("remove_watch", None, None, Some(&format!("entry_id: {:?}", entry_id)));
         self.mark_changed();
         Ok(vec![])
     }
@@ -554,12 +402,6 @@ impl Router {
         }
 
         drop(session);
-        self.record_audit(
-            if enabled { "freeze_enabled" } else { "freeze_disabled" },
-            None,
-            freeze_addr,
-            Some(&format!("entry_id: {:?}, value: {:?}", entry_id, value)),
-        );
         self.mark_changed();
 
         Ok(vec![])
@@ -569,7 +411,6 @@ impl Router {
         let mut session = self.session.write_or_error()?;
         session.set_freeze_enabled(false);
         drop(session);
-        self.record_audit("disable_all_freezes", None, None, None);
         Ok(vec![])
     }
 
@@ -577,21 +418,19 @@ impl Router {
 
     fn start_scan(
         &self,
-        scan_id: messpit_protocol::ScanId,
+        _scan_id: messpit_protocol::ScanId,
         _params: messpit_protocol::ScanParams,
     ) -> Result<Vec<EngineEvent>, EngineError> {
         // Scan functionality is primarily handled by the Tauri commands
         // This is a placeholder for the engine router
-        self.record_audit("start_scan", None, None, Some(&format!("scan_id: {:?}", scan_id)));
         Ok(vec![])
     }
 
     fn refine_scan(
         &self,
-        scan_id: messpit_protocol::ScanId,
+        _scan_id: messpit_protocol::ScanId,
         _refinement: messpit_protocol::Refinement,
     ) -> Result<Vec<EngineEvent>, EngineError> {
-        self.record_audit("refine_scan", None, None, Some(&format!("scan_id: {:?}", scan_id)));
         Ok(vec![])
     }
 
@@ -616,7 +455,6 @@ impl Router {
         &self,
         scan_id: messpit_protocol::ScanId,
     ) -> Result<Vec<EngineEvent>, EngineError> {
-        self.record_audit("cancel_scan", None, None, Some(&format!("scan_id: {:?}", scan_id)));
         Ok(vec![EngineEvent::ScanCancelled { scan_id }])
     }
 
@@ -691,12 +529,6 @@ impl Router {
             .collect();
 
         drop(session);
-        self.record_audit(
-            "pattern_scan",
-            None,
-            None,
-            Some(&format!("job_id: {:?}, module: {:?}, matches: {}", job_id, module, matches.len())),
-        );
 
         Ok(vec![EngineEvent::PatternScanResults { job_id, matches }])
     }
@@ -741,18 +573,11 @@ impl Router {
         &self,
         run_id: RunId,
         _script_id: messpit_protocol::ScriptId,
-        source: String,
+        _source: String,
         _args: Vec<String>,
     ) -> Result<Vec<EngineEvent>, EngineError> {
         // Script execution is handled by the script-host crate and Tauri commands
-        // This router method records the audit trail and returns a placeholder
-
-        self.record_audit(
-            "run_script",
-            None,
-            None,
-            Some(&format!("run_id: {:?}, source_len: {}", run_id, source.len())),
-        );
+        // This router method returns a placeholder event.
 
         // In a full implementation, we would:
         // 1. Register the job
@@ -772,7 +597,6 @@ impl Router {
         if let Ok(jobs) = self.jobs.read() {
             if let Some(job) = jobs.get(&job_id) {
                 job.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.record_audit("cancel_job", None, None, Some(&format!("job_id: {:?}", job_id)));
                 return Ok(vec![]);
             }
         }
@@ -819,7 +643,6 @@ impl Router {
         drop(project);
 
         self.mark_saved();
-        self.record_audit("save_project", None, None, Some(&format!("path: {}", path)));
 
         Ok(vec![EngineEvent::ProjectSaved { path }])
     }
@@ -875,7 +698,6 @@ impl Router {
 
         drop(session);
         self.mark_saved(); // Just loaded, so no unsaved changes
-        self.record_audit("load_project", None, None, Some(&format!("path: {}", path)));
 
         Ok(vec![EngineEvent::ProjectLoaded { path }])
     }
@@ -885,50 +707,6 @@ impl Router {
 mod tests {
     use super::*;
     use messpit_protocol::{Value, ValueType};
-
-    #[test]
-    fn test_audit_log_new() {
-        let log = AuditLog::new(100);
-        assert!(log.entries.is_empty());
-        assert_eq!(log.max_entries, 100);
-    }
-
-    #[test]
-    fn test_audit_log_record() {
-        let mut log = AuditLog::new(10);
-        let entry = log.record("test_op", Some(1234), Some(Address(0x1000)), Some("details"));
-
-        assert_eq!(entry.operation, "test_op");
-        assert_eq!(entry.target_pid, Some(1234));
-        assert_eq!(entry.address, Some(Address(0x1000)));
-        assert_eq!(entry.details, Some("details".to_string()));
-        assert_eq!(log.entries.len(), 1);
-    }
-
-    #[test]
-    fn test_audit_log_max_entries() {
-        let mut log = AuditLog::new(3);
-
-        log.record("op1", None, None, None);
-        log.record("op2", None, None, None);
-        log.record("op3", None, None, None);
-        log.record("op4", None, None, None); // Should evict op1
-
-        assert_eq!(log.entries.len(), 3);
-        let entries = log.entries();
-        assert_eq!(entries[0].operation, "op2");
-        assert_eq!(entries[2].operation, "op4");
-    }
-
-    #[test]
-    fn test_audit_log_clear() {
-        let mut log = AuditLog::new(10);
-        log.record("op", None, None, None);
-        assert_eq!(log.entries.len(), 1);
-
-        log.clear();
-        assert!(log.entries.is_empty());
-    }
 
     #[test]
     fn test_decode_encode_roundtrip_i32() {

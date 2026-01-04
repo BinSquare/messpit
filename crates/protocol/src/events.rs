@@ -129,9 +129,6 @@ pub enum EngineEvent {
         reason: PolicyDenialReason,
     },
 
-    /// Audit record for mutating operations
-    AuditRecord { record: AuditEntry },
-
     // === Errors ===
     /// An error occurred processing a command
     Error(EngineError),
@@ -198,16 +195,6 @@ pub struct PolicyDenialReason {
     pub message: String,
     /// Actionable suggestion for the user
     pub suggestion: Option<String>,
-}
-
-/// Audit log entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditEntry {
-    pub timestamp: String,
-    pub operation: String,
-    pub target_pid: Option<u32>,
-    pub address: Option<Address>,
-    pub details: Option<String>,
 }
 
 /// Structured error from the engine

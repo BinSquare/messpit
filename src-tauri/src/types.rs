@@ -17,6 +17,23 @@ pub struct ProcessInfo {
     pub attachable: bool,
 }
 
+/// Request to filter process list server-side
+#[derive(Deserialize)]
+pub struct ProcessListRequest {
+    pub filter: Option<String>,
+    pub show_only_attachable: bool,
+    pub pinned_pids: Vec<u32>,
+    pub limit: Option<usize>,
+    pub include_paths: bool,
+}
+
+/// Process list response with total count
+#[derive(Serialize)]
+pub struct ProcessListResponse {
+    pub processes: Vec<ProcessInfo>,
+    pub total: usize,
+}
+
 /// Attach result returned to frontend
 #[derive(Serialize)]
 pub struct AttachResult {
@@ -35,8 +52,6 @@ pub struct RegionInfo {
     pub writable: bool,
     pub executable: bool,
     pub module: Option<String>,
-    /// First 16 bytes as hex preview (if readable)
-    pub preview: Option<String>,
 }
 
 // ============================================================================
@@ -126,16 +141,6 @@ pub struct ProjectInfo {
     pub path: Option<String>,
     pub watch_count: usize,
     pub has_unsaved_changes: bool,
-}
-
-/// Audit log entry info
-#[derive(Serialize)]
-pub struct AuditEntryInfo {
-    pub timestamp: String,
-    pub operation: String,
-    pub pid: Option<u32>,
-    pub address: Option<String>,
-    pub details: Option<String>,
 }
 
 // ============================================================================

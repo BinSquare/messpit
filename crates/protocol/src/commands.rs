@@ -52,7 +52,7 @@ pub enum EngineCommand {
     WriteValue {
         address: Address,
         value: Value,
-        /// Reason for the write (for audit log)
+        /// Reason for the write
         reason: String,
     },
 

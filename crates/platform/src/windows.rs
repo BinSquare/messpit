@@ -423,7 +423,7 @@ fn get_process_name_and_path(handle: HANDLE, pid: u32) -> (String, Option<String
 }
 
 /// List all processes on the system
-pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
+pub fn list_processes(check_attachable: bool, include_path: bool) -> Result<Vec<ProcessInfo>, PlatformError> {
     let mut processes = Vec::new();
 
     // Create a snapshot of all processes
@@ -452,10 +452,14 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
             let name = wchar_to_string(&entry.szExeFile);
 
             // Try to get the full path by briefly opening the process
-            let path = get_process_path(pid);
+            let path = if include_path { get_process_path(pid) } else { None };
 
             // Check if we can attach (try to open with minimal rights)
-            let attachable = is_process_attachable(pid);
+            let attachable = if check_attachable {
+                is_process_attachable(pid)
+            } else {
+                true
+            };
 
             processes.push(ProcessInfo {
                 pid: Pid(pid),
